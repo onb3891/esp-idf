@@ -43,6 +43,8 @@ static const char* UART_TAG = "uart";
 #define UART_EMPTY_THRESH_DEFAULT  (10)
 #define UART_FULL_THRESH_DEFAULT  (120)
 #define UART_TOUT_THRESH_DEFAULT   (10)
+#define UART_CLKDIV_FRAG_BIT_WIDTH  (3)
+#define UART_TOUT_REF_FACTOR_DEFAULT (UART_CLK_FREQ/(REF_CLK_FREQ<<UART_CLKDIV_FRAG_BIT_WIDTH))
 #define UART_TX_IDLE_NUM_DEFAULT   (0)
 #define UART_PATTERN_DET_QLEN_DEFAULT (10)
 
@@ -411,6 +413,19 @@ int uart_pattern_pop_pos(uart_port_t uart_num)
     return pos;
 }
 
+int uart_pattern_get_pos(uart_port_t uart_num)
+{
+    UART_CHECK((p_uart_obj[uart_num]), "uart driver error", (-1));
+    UART_ENTER_CRITICAL(&uart_spinlock[uart_num]);
+    uart_pat_rb_t* pat_pos = &p_uart_obj[uart_num]->rx_pattern_pos;
+    int pos = -1;
+    if (pat_pos != NULL && pat_pos->rd != pat_pos->wr) {
+        pos = pat_pos->data[pat_pos->rd];
+    }
+    UART_EXIT_CRITICAL(&uart_spinlock[uart_num]);
+    return pos;
+}
+
 esp_err_t uart_pattern_queue_reset(uart_port_t uart_num, int queue_length)
 {
     UART_CHECK((uart_num < UART_NUM_MAX), "uart_num error", ESP_FAIL);
@@ -641,7 +656,13 @@ esp_err_t uart_intr_config(uart_port_t uart_num, const uart_intr_config_t *intr_
     UART_ENTER_CRITICAL(&uart_spinlock[uart_num]);
     UART[uart_num]->int_clr.val = UART_INTR_MASK;
     if(intr_conf->intr_enable_mask & UART_RXFIFO_TOUT_INT_ENA_M) {
-        UART[uart_num]->conf1.rx_tout_thrhd = ((intr_conf->rx_timeout_thresh) & UART_RX_TOUT_THRHD_V);
+        //Hardware issue workaround: when using ref_tick, the rx timeout threshold needs increase to 10 times.
+        //T_ref = T_apb * APB_CLK/(REF_TICK << CLKDIV_FRAG_BIT_WIDTH)
+        if(UART[uart_num]->conf0.tick_ref_always_on == 0) {
+            UART[uart_num]->conf1.rx_tout_thrhd = ((intr_conf->rx_timeout_thresh * UART_TOUT_REF_FACTOR_DEFAULT) & UART_RX_TOUT_THRHD_V);
+        } else {
+            UART[uart_num]->conf1.rx_tout_thrhd = ((intr_conf->rx_timeout_thresh) & UART_RX_TOUT_THRHD_V);
+        }
         UART[uart_num]->conf1.rx_tout_en = 1;
     } else {
         UART[uart_num]->conf1.rx_tout_en = 0;
@@ -823,6 +844,7 @@ static void uart_rx_intr_handler_default(void *param)
                 //If we fail to push data to ring buffer, we will have to stash the data, and send next time.
                 //Mainly for applications that uses flow control or small ring buffer.
                 if(pdFALSE == xRingbufferSendFromISR(p_uart->rx_ring_buf, p_uart->rx_data_buf, p_uart->rx_stash_len, &HPTaskAwoken)) {
+                    p_uart->rx_buffer_full_flg = true;
                     uart_disable_intr_mask(uart_num, UART_RXFIFO_TOUT_INT_ENA_M | UART_RXFIFO_FULL_INT_ENA_M);
                     if (uart_event.type == UART_PATTERN_DET) {
                         if (rx_fifo_len < pat_num) {
@@ -841,7 +863,6 @@ static void uart_rx_intr_handler_default(void *param)
                         }
                     }
                     uart_event.type = UART_BUFFER_FULL;
-                    p_uart->rx_buffer_full_flg = true;
                 } else {
                     UART_ENTER_CRITICAL_ISR(&uart_spinlock[uart_num]);
                     if (uart_intr_status & UART_AT_CMD_CHAR_DET_INT_ST_M) {
@@ -1072,6 +1093,22 @@ int uart_write_bytes_with_break(uart_port_t uart_num, const char* src, size_t si
     return uart_tx_all(uart_num, src, size, 1, brk_len);
 }
 
+static bool uart_check_buf_full(uart_port_t uart_num)
+{
+    if(p_uart_obj[uart_num]->rx_buffer_full_flg) {
+        BaseType_t res = xRingbufferSend(p_uart_obj[uart_num]->rx_ring_buf, p_uart_obj[uart_num]->rx_data_buf, p_uart_obj[uart_num]->rx_stash_len, 1);
+        if(res == pdTRUE) {
+            UART_ENTER_CRITICAL(&uart_spinlock[uart_num]);
+            p_uart_obj[uart_num]->rx_buffered_len += p_uart_obj[uart_num]->rx_stash_len;
+            p_uart_obj[uart_num]->rx_buffer_full_flg = false;
+            UART_EXIT_CRITICAL(&uart_spinlock[uart_num]);
+            uart_enable_rx_intr(p_uart_obj[uart_num]->uart_num);
+            return true;
+        }
+    }
+    return false;
+}
+
 int uart_read_bytes(uart_port_t uart_num, uint8_t* buf, uint32_t length, TickType_t ticks_to_wait)
 {
     UART_CHECK((uart_num < UART_NUM_MAX), "uart_num error", (-1));
@@ -1092,8 +1129,17 @@ int uart_read_bytes(uart_port_t uart_num, uint8_t* buf, uint32_t length, TickTyp
                 p_uart_obj[uart_num]->rx_ptr = data;
                 p_uart_obj[uart_num]->rx_cur_remain = size;
             } else {
-                xSemaphoreGive(p_uart_obj[uart_num]->rx_mux);
-                return copy_len;
+                //When using dual cores, `rx_buffer_full_flg` may read and write on different cores at same time,
+                //which may lose synchronization. So we also need to call `uart_check_buf_full` once when ringbuffer is empty
+                //to solve the possible asynchronous issues.
+                if(uart_check_buf_full(uart_num)) {
+                    //This condition will never be true if `uart_read_bytes`
+                    //and `uart_rx_intr_handler_default` are scheduled on the same core.
+                    continue;
+                } else {
+                    xSemaphoreGive(p_uart_obj[uart_num]->rx_mux);
+                    return copy_len;
+                }
             }
         }
         if(p_uart_obj[uart_num]->rx_cur_remain > length) {
@@ -1114,16 +1160,7 @@ int uart_read_bytes(uart_port_t uart_num, uint8_t* buf, uint32_t length, TickTyp
             vRingbufferReturnItem(p_uart_obj[uart_num]->rx_ring_buf, p_uart_obj[uart_num]->rx_head_ptr);
             p_uart_obj[uart_num]->rx_head_ptr = NULL;
             p_uart_obj[uart_num]->rx_ptr = NULL;
-            if(p_uart_obj[uart_num]->rx_buffer_full_flg) {
-                BaseType_t res = xRingbufferSend(p_uart_obj[uart_num]->rx_ring_buf, p_uart_obj[uart_num]->rx_data_buf, p_uart_obj[uart_num]->rx_stash_len, 1);
-                if(res == pdTRUE) {
-                    UART_ENTER_CRITICAL(&uart_spinlock[uart_num]);
-                    p_uart_obj[uart_num]->rx_buffered_len += p_uart_obj[uart_num]->rx_stash_len;
-                    UART_EXIT_CRITICAL(&uart_spinlock[uart_num]);
-                    p_uart_obj[uart_num]->rx_buffer_full_flg = false;
-                    uart_enable_rx_intr(p_uart_obj[uart_num]->uart_num);
-                }
-            }
+            uart_check_buf_full(uart_num);
         }
     }
 
@@ -1165,6 +1202,14 @@ esp_err_t uart_flush_input(uart_port_t uart_num)
         }
         data = (uint8_t*) xRingbufferReceive(p_uart->rx_ring_buf, &size, (portTickType) 0);
         if(data == NULL) {
+            if( p_uart_obj[uart_num]->rx_buffered_len != 0 ) {
+                ESP_LOGE(UART_TAG, "rx_buffered_len error");
+                p_uart_obj[uart_num]->rx_buffered_len = 0; 
+            }
+            //We also need to clear the `rx_buffer_full_flg` here.
+            UART_ENTER_CRITICAL(&uart_spinlock[uart_num]);
+            p_uart_obj[uart_num]->rx_buffer_full_flg = false;
+            UART_EXIT_CRITICAL(&uart_spinlock[uart_num]);
             break;
         }
         UART_ENTER_CRITICAL(&uart_spinlock[uart_num]);
@@ -1177,8 +1222,8 @@ esp_err_t uart_flush_input(uart_port_t uart_num)
             if(res == pdTRUE) {
                 UART_ENTER_CRITICAL(&uart_spinlock[uart_num]);
                 p_uart_obj[uart_num]->rx_buffered_len += p_uart_obj[uart_num]->rx_stash_len;
-                UART_EXIT_CRITICAL(&uart_spinlock[uart_num]);
                 p_uart_obj[uart_num]->rx_buffer_full_flg = false;
+                UART_EXIT_CRITICAL(&uart_spinlock[uart_num]);
             }
         }
     }

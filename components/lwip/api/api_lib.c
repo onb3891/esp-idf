@@ -128,6 +128,9 @@ netconn_new_with_proto_and_callback(enum netconn_type t, u8_t proto, netconn_cal
       LWIP_ASSERT("conn has no op_completed", sys_sem_valid(&conn->op_completed));
       sys_sem_free(&conn->op_completed);
 #endif /* !LWIP_NETCONN_SEM_PER_THREAD */
+#if ESP_THREAD_SAFE
+      sys_mbox_set_owner(&conn->recvmbox, NULL);
+#endif
       sys_mbox_free(&conn->recvmbox);
       memp_free(MEMP_NETCONN, conn);
       return NULL;
@@ -407,9 +410,9 @@ netconn_accept(struct netconn *conn, struct netconn **new_conn)
 #if TCP_LISTEN_BACKLOG
   /* Let the stack know that we have accepted the connection. */
   API_MSG_VAR_ALLOC_DONTFAIL(msg);
-  API_MSG_VAR_REF(msg).msg.conn = conn;
-  /* don't care for the return value of lwip_netconn_do_recv */
-  TCPIP_APIMSG_NOERR(&API_MSG_VAR_REF(msg), lwip_netconn_do_recv);
+  API_MSG_VAR_REF(msg).msg.conn = newconn;
+  /* don't care for the return value of lwip_netconn_do_accepted */
+  TCPIP_APIMSG_NOERR(&API_MSG_VAR_REF(msg), lwip_netconn_do_accepted);
   API_MSG_VAR_FREE(msg);
 #endif /* TCP_LISTEN_BACKLOG */
 

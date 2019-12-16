@@ -1631,11 +1631,12 @@ BOOLEAN  L2CA_RegisterFixedChannel (UINT16 fixed_cid, tL2CAP_FIXED_CHNL_REG *p_f
 **
 **  Parameters:     Fixed CID
 **                  BD Address of remote
+**                  BD Address type
 **
 **  Return value:   TRUE if connection started
 **
 *******************************************************************************/
-BOOLEAN L2CA_ConnectFixedChnl (UINT16 fixed_cid, BD_ADDR rem_bda)
+BOOLEAN L2CA_ConnectFixedChnl (UINT16 fixed_cid, BD_ADDR rem_bda, tBLE_ADDR_TYPE bd_addr_type)
 {
     tL2C_LCB *p_lcb;
     tBT_TRANSPORT transport = BT_TRANSPORT_BR_EDR;
@@ -1723,7 +1724,9 @@ BOOLEAN L2CA_ConnectFixedChnl (UINT16 fixed_cid, BD_ADDR rem_bda)
         l2cu_release_lcb (p_lcb);
         return FALSE;
     }
-
+#if (BLE_INCLUDED == TRUE)
+    p_lcb->open_addr_type = bd_addr_type;
+#endif
     if (!l2cu_create_conn(p_lcb, transport)) {
         L2CAP_TRACE_WARNING ("%s() - create_conn failed", __func__);
         l2cu_release_lcb (p_lcb);
@@ -1873,7 +1876,7 @@ BOOLEAN L2CA_RemoveFixedChnl (UINT16 fixed_cid, BD_ADDR rem_bda)
     p_lcb = l2cu_find_lcb_by_bd_addr (rem_bda, transport);
 
     if ( ((p_lcb) == NULL) || (!p_lcb->p_fixed_ccbs[fixed_cid - L2CAP_FIRST_FIXED_CHNL]) ) {
-        L2CAP_TRACE_WARNING ("L2CA_RemoveFixedChnl()  CID: 0x%04x  BDA: %08x%04x not connected", fixed_cid,
+        L2CAP_TRACE_DEBUG ("L2CA_RemoveFixedChnl()  CID: 0x%04x  BDA: %08x%04x not connected", fixed_cid,
                              (rem_bda[0] << 24) + (rem_bda[1] << 16) + (rem_bda[2] << 8) + rem_bda[3], (rem_bda[4] << 8) + rem_bda[5]);
         return (FALSE);
     }

@@ -403,7 +403,6 @@ tBTM_STATUS BTM_BleObserve(BOOLEAN start, UINT32 duration,
                                                   BTM_BLE_DEFAULT_SFP);
             }
 
-            p_inq->scan_duplicate_filter = BTM_BLE_DUPLICATE_DISABLE;
             status = btm_ble_start_scan();
         }
 
@@ -442,7 +441,6 @@ tBTM_STATUS BTM_BleObserve(BOOLEAN start, UINT32 duration,
 tBTM_STATUS BTM_BleScan(BOOLEAN start, UINT32 duration,
                            tBTM_INQ_RESULTS_CB *p_results_cb, tBTM_CMPL_CB *p_cmpl_cb)
 {
-    tBTM_BLE_INQ_CB *p_inq = &btm_cb.ble_ctr_cb.inq_var;
     tBTM_STATUS status = BTM_WRONG_MODE;
 
     if (!controller_get_interface()->supports_ble()) {
@@ -467,7 +465,6 @@ tBTM_STATUS BTM_BleScan(BOOLEAN start, UINT32 duration,
             /* enable resolving list */
             btm_ble_enable_resolving_list_for_platform(BTM_BLE_RL_SCAN);
 #endif
-            p_inq->scan_duplicate_filter = BTM_BLE_DUPLICATE_DISABLE;
             status = btm_ble_start_scan();
         }
 
@@ -756,10 +753,18 @@ BOOLEAN BTM_BleConfigPrivacy(BOOLEAN privacy_mode, tBTM_SET_LOCAL_PRIVACY_CBACK 
     if (p_cb->privacy_mode == BTM_PRIVACY_NONE
         && random_cb->own_addr_type == BLE_ADDR_RANDOM) {
         BTM_TRACE_ERROR("Have set random adress, can't set privacy ");
+        if (random_cb && random_cb->set_local_privacy_cback){
+            (*random_cb->set_local_privacy_cback)(BTM_SET_PRIVACY_FAIL);
+            random_cb->set_local_privacy_cback = NULL;
+        }
         return FALSE;
     }
-    if (!(p_cb->inq_var.state != BTM_BLE_STOP_SCAN && p_cb->inq_var.state != BTM_BLE_STOP_ADV)) {
+    if (!(p_cb->inq_var.state == BTM_BLE_STOP_SCAN || p_cb->inq_var.state == BTM_BLE_STOP_ADV || p_cb->inq_var.state == BTM_BLE_IDLE)) {
         BTM_TRACE_ERROR("Advertising or scaning now, can't set privacy ");
+        if (random_cb && random_cb->set_local_privacy_cback){
+            (*random_cb->set_local_privacy_cback)(BTM_SET_PRIVACY_FAIL);
+            random_cb->set_local_privacy_cback = NULL;
+        }
         return FALSE;
     }
 
@@ -1199,11 +1204,18 @@ tBTM_STATUS BTM_BleSetAdvParamsStartAdv(UINT16 adv_int_min, UINT16 adv_int_max, 
  */
     if (btm_cb.ble_ctr_cb.addr_mgnt_cb.own_addr_type == BLE_ADDR_RANDOM && own_bda_type == BLE_ADDR_PUBLIC) {
         BTM_TRACE_ERROR ("own_addr_type is BLE_ADDR_RANDOM but use BLE_ADDR_PUBLIC\n");
+        if(adv_cb) {
+            (* adv_cb)(HCI_ERR_ESP_VENDOR_FAIL);
+        }
         return BTM_ILLEGAL_VALUE;
     }
 
     if (!BTM_BLE_ISVALID_PARAM(adv_int_min, BTM_BLE_ADV_INT_MIN, BTM_BLE_ADV_INT_MAX) ||
             !BTM_BLE_ISVALID_PARAM(adv_int_max, BTM_BLE_ADV_INT_MIN, BTM_BLE_ADV_INT_MAX)) {
+         BTM_TRACE_ERROR ("adv_int_min or adv_int_max is invalid\n");    
+        if(adv_cb) {
+            (* adv_cb)(HCI_ERR_ESP_VENDOR_FAIL);
+        }
         return BTM_ILLEGAL_VALUE;
     }
 
@@ -1355,7 +1367,7 @@ void BTM_BleSetScanParams(tGATT_IF client_if, UINT32 scan_interval, UINT32 scan_
 }
 
 void BTM_BleSetScanFilterParams(tGATT_IF client_if, UINT32 scan_interval, UINT32 scan_window,
-                                tBLE_SCAN_MODE scan_mode, UINT8 addr_type_own, tBTM_BLE_SFP scan_filter_policy,
+                                tBLE_SCAN_MODE scan_mode, UINT8 addr_type_own, UINT8 scan_duplicate_filter, tBTM_BLE_SFP scan_filter_policy,
                                 tBLE_SCAN_PARAM_SETUP_CBACK scan_setup_status_cback)
 {
     tBTM_BLE_INQ_CB *p_cb = &btm_cb.ble_ctr_cb.inq_var;
@@ -1392,12 +1404,14 @@ void BTM_BleSetScanFilterParams(tGATT_IF client_if, UINT32 scan_interval, UINT32
 
     if (BTM_BLE_ISVALID_PARAM(scan_interval, BTM_BLE_SCAN_INT_MIN, max_scan_interval) &&
             BTM_BLE_ISVALID_PARAM(scan_window, BTM_BLE_SCAN_WIN_MIN, max_scan_window) &&
-            (scan_mode == BTM_BLE_SCAN_MODE_ACTI || scan_mode == BTM_BLE_SCAN_MODE_PASS)) {
+            (scan_mode == BTM_BLE_SCAN_MODE_ACTI || scan_mode == BTM_BLE_SCAN_MODE_PASS) &&
+            (scan_duplicate_filter < BTM_BLE_SCAN_DUPLICATE_MAX)) {
         p_cb->scan_type = scan_mode;
         p_cb->scan_interval = scan_interval;
         p_cb->scan_window = scan_window;
         p_cb->sfp = scan_filter_policy;
         p_cb->scan_params_set = TRUE;
+        p_cb->scan_duplicate_filter = scan_duplicate_filter;
 
         btsnd_hcic_ble_set_scan_params(p_cb->scan_type, (UINT16)scan_interval,
                                        (UINT16)scan_window,
@@ -1558,12 +1572,10 @@ tBTM_STATUS BTM_BleWriteAdvDataRaw(UINT8 *p_raw_adv, UINT32 raw_adv_len)
 ** Returns          void
 **
 *******************************************************************************/
-BOOLEAN BTM_BleSetRandAddress(BD_ADDR rand_addr)
+tBTM_STATUS BTM_BleSetRandAddress(BD_ADDR rand_addr)
 {
-    BOOLEAN set_flag = false;
-
 	if (rand_addr == NULL)
-		return set_flag;
+		return BTM_SET_STATIC_RAND_ADDR_FAIL;
 
 /*
  *  Temporary solutions for pair with random address:
@@ -1573,19 +1585,22 @@ BOOLEAN BTM_BleSetRandAddress(BD_ADDR rand_addr)
 #if BLE_PRIVACY_SPT == TRUE
     if (btm_cb.ble_ctr_cb.privacy_mode != BTM_PRIVACY_NONE) {
         BTM_TRACE_ERROR("privacy_mode is not BTM_PRIVACY_NONE ");
-        return set_flag;
+        return BTM_SET_STATIC_RAND_ADDR_FAIL;
     }
 
 #endif
-    if (!(btm_cb.ble_ctr_cb.inq_var.state != BTM_BLE_STOP_SCAN && btm_cb.ble_ctr_cb.inq_var.state != BTM_BLE_STOP_ADV)) {
-        BTM_TRACE_ERROR("Advertising or scaning now, can't set randaddress ");
-        return FALSE;
+    if (!(btm_cb.ble_ctr_cb.inq_var.state == BTM_BLE_STOP_SCAN || btm_cb.ble_ctr_cb.inq_var.state == BTM_BLE_STOP_ADV || btm_cb.ble_ctr_cb.inq_var.state == BTM_BLE_IDLE)) {
+        BTM_TRACE_ERROR("Advertising or scaning now, can't set randaddress %d", btm_cb.ble_ctr_cb.inq_var.state);
+        return BTM_SET_STATIC_RAND_ADDR_FAIL;
     }
     memcpy(btm_cb.ble_ctr_cb.addr_mgnt_cb.private_addr, rand_addr, BD_ADDR_LEN);
     btm_cb.ble_ctr_cb.addr_mgnt_cb.own_addr_type = BLE_ADDR_RANDOM;
     //send the set random address to the controller
-    set_flag = btsnd_hcic_ble_set_random_addr(rand_addr);
-    return set_flag;
+    if(btsnd_hcic_ble_set_random_addr(rand_addr)) {
+        return BTM_SUCCESS;
+    } else {
+        return BTM_SET_STATIC_RAND_ADDR_FAIL;
+    }
 }
 
 /*******************************************************************************
@@ -2266,7 +2281,6 @@ tBTM_STATUS btm_ble_start_inquiry (UINT8 mode, UINT8   duration)
         /* enable IRK list */
         btm_ble_enable_resolving_list_for_platform(BTM_BLE_RL_SCAN);
 #endif
-        p_ble_cb->inq_var.scan_duplicate_filter  = BTM_BLE_DUPLICATE_DISABLE;
         status = btm_ble_start_scan();
     } else if ((p_ble_cb->inq_var.scan_interval != BTM_BLE_LOW_LATENCY_SCAN_INT) ||
                (p_ble_cb->inq_var.scan_window != BTM_BLE_LOW_LATENCY_SCAN_WIN)) {
@@ -2557,7 +2571,7 @@ static void btm_ble_parse_adv_data(tBTM_INQ_INFO *p_info, UINT8 *p_data,
 ** Returns          void
 **
 *******************************************************************************/
-void btm_ble_cache_adv_data(tBTM_INQ_RESULTS *p_cur, UINT8 data_len, UINT8 *p, UINT8 evt_type)
+void btm_ble_cache_adv_data(BD_ADDR bda, tBTM_INQ_RESULTS *p_cur, UINT8 data_len, UINT8 *p, UINT8 evt_type)
 {
     tBTM_BLE_INQ_CB     *p_le_inq_cb = &btm_cb.ble_ctr_cb.inq_var;
     UINT8 *p_cache;
@@ -2566,6 +2580,15 @@ void btm_ble_cache_adv_data(tBTM_INQ_RESULTS *p_cur, UINT8 data_len, UINT8 *p, U
     /* cache adv report/scan response data */
     if (evt_type != BTM_BLE_SCAN_RSP_EVT) {
         p_le_inq_cb->adv_len = 0;
+        memset(p_le_inq_cb->adv_data_cache, 0, BTM_BLE_CACHE_ADV_DATA_MAX);
+        p_cur->adv_data_len = 0;
+        p_cur->scan_rsp_len = 0;
+    } 
+
+    //Clear the adv cache if the addresses are not equal
+    if(memcmp(bda, p_le_inq_cb->adv_addr, BD_ADDR_LEN) != 0) {
+        p_le_inq_cb->adv_len = 0;
+        memcpy(p_le_inq_cb->adv_addr, bda, BD_ADDR_LEN);
         memset(p_le_inq_cb->adv_data_cache, 0, BTM_BLE_CACHE_ADV_DATA_MAX);
         p_cur->adv_data_len = 0;
         p_cur->scan_rsp_len = 0;
@@ -2798,7 +2821,7 @@ static void btm_ble_appearance_to_cod(UINT16 appearance, UINT8 *dev_class)
 ** Returns          void
 **
 *******************************************************************************/
-BOOLEAN btm_ble_update_inq_result(tINQ_DB_ENT *p_i, UINT8 addr_type, UINT8 evt_type, UINT8 *p)
+BOOLEAN btm_ble_update_inq_result(BD_ADDR bda, tINQ_DB_ENT *p_i, UINT8 addr_type, UINT8 evt_type, UINT8 *p)
 {
     BOOLEAN             to_report = TRUE;
     tBTM_INQ_RESULTS     *p_cur = &p_i->inq_info.results;
@@ -2816,7 +2839,7 @@ BOOLEAN btm_ble_update_inq_result(tINQ_DB_ENT *p_i, UINT8 addr_type, UINT8 evt_t
         BTM_TRACE_WARNING("EIR data too long %d. discard", data_len);
         return FALSE;
     }
-    btm_ble_cache_adv_data(p_cur, data_len, p, evt_type);
+    btm_ble_cache_adv_data(bda, p_cur, data_len, p, evt_type);
 
     p1 = (p + data_len);
     STREAM_TO_UINT8 (rssi, p1);
@@ -2832,7 +2855,9 @@ BOOLEAN btm_ble_update_inq_result(tINQ_DB_ENT *p_i, UINT8 addr_type, UINT8 evt_t
         BTM_TRACE_DEBUG("btm_ble_update_inq_result scan_rsp=false, to_report=false,\
                               scan_type_active=%d", btm_cb.ble_ctr_cb.inq_var.scan_type);
         p_i->scan_rsp = FALSE;
+#if BTM_BLE_ACTIVE_SCAN_REPORT_ADV_SCAN_RSP_INDIVIDUALLY == FALSE
         to_report = FALSE;
+#endif
     } else {
         p_i->scan_rsp = TRUE;
     }
@@ -2984,14 +3009,14 @@ void btm_send_sel_conn_callback(BD_ADDR remote_bda, UINT8 evt_type, UINT8 *p_dat
 void btm_ble_process_adv_pkt (UINT8 *p_data)
 {
     BD_ADDR             bda;
-    BD_ADDR             temp_bda;
-    UINT8               temp_addr_type = 0;
     UINT8               evt_type = 0, *p = p_data;
     UINT8               addr_type = 0;
     UINT8               num_reports;
     UINT8               data_len;
 #if (defined BLE_PRIVACY_SPT && BLE_PRIVACY_SPT == TRUE)
     BOOLEAN             match = FALSE;
+    BD_ADDR             temp_bda;
+    UINT8               temp_addr_type = 0;
 #endif
 
     /* Only process the results if the inquiry is still active */
@@ -3007,11 +3032,12 @@ void btm_ble_process_adv_pkt (UINT8 *p_data)
         STREAM_TO_UINT8    (evt_type, p);
         STREAM_TO_UINT8    (addr_type, p);
         STREAM_TO_BDADDR   (bda, p);
-        temp_addr_type = addr_type;
-        memcpy(temp_bda, bda, BD_ADDR_LEN);
         //BTM_TRACE_ERROR("btm_ble_process_adv_pkt:bda= %0x:%0x:%0x:%0x:%0x:%0x\n",
         //                              bda[0],bda[1],bda[2],bda[3],bda[4],bda[5]);
 #if (defined BLE_PRIVACY_SPT && BLE_PRIVACY_SPT == TRUE)
+        temp_addr_type = addr_type;
+        memcpy(temp_bda, bda, BD_ADDR_LEN);
+        
         /* map address to security record */
         match = btm_identity_addr_to_random_pseudo(bda, &addr_type, FALSE);
 
@@ -3023,6 +3049,7 @@ void btm_ble_process_adv_pkt (UINT8 *p_data)
         } else
 #endif
         btm_ble_process_adv_pkt_cont(bda, addr_type, evt_type, p);
+#if (defined BLE_PRIVACY_SPT && BLE_PRIVACY_SPT == TRUE)
         //save current adv addr information if p_dev_rec!= NULL
         tBTM_SEC_DEV_REC *p_dev_rec = btm_find_dev (bda);
         if(p_dev_rec) {
@@ -3030,10 +3057,76 @@ void btm_ble_process_adv_pkt (UINT8 *p_data)
             memcpy(p_dev_rec->ble.current_addr, temp_bda, BD_ADDR_LEN);
             p_dev_rec->ble.current_addr_valid = true;
         }
+#endif
         STREAM_TO_UINT8(data_len, p);
 
         /* Advance to the next event data_len + rssi byte */
         p += data_len + 1;
+    }
+}
+
+/*******************************************************************************
+**
+** Function         btm_ble_process_last_adv_pkt
+**
+** Description      This function is called to report last adv packet
+**
+** Parameters
+**
+** Returns          void
+**
+*******************************************************************************/
+
+static void btm_ble_process_last_adv_pkt(void)
+{
+    UINT8       result = 0;
+    UINT8       null_bda[6] = {0};
+    tBTM_INQUIRY_VAR_ST  *p_inq = &btm_cb.btm_inq_vars;
+    tBTM_INQ_RESULTS_CB  *p_inq_results_cb = p_inq->p_inq_results_cb;
+    tBTM_INQ_RESULTS_CB  *p_obs_results_cb = btm_cb.ble_ctr_cb.p_obs_results_cb;
+    tBTM_INQ_RESULTS_CB  *p_scan_results_cb = btm_cb.ble_ctr_cb.p_scan_results_cb;
+    tBTM_BLE_INQ_CB      *p_le_inq_cb = &btm_cb.ble_ctr_cb.inq_var;
+    tINQ_DB_ENT          *p_i = btm_inq_db_find (p_le_inq_cb->adv_addr);
+
+    if(memcmp(null_bda, p_le_inq_cb->adv_addr, BD_ADDR_LEN) == 0) {
+        return;
+    }
+
+    if(p_i == NULL) {
+        BTM_TRACE_DEBUG("no last adv");
+        return;
+    }
+
+    if ((result = btm_ble_is_discoverable(p_le_inq_cb->adv_addr, p_i->inq_info.results.ble_evt_type, NULL)) == 0) {
+        BTM_TRACE_WARNING("%s device is no longer discoverable so discarding advertising packet pkt",
+                 __func__);
+        return;
+    }
+    /* background connection in selective connection mode */
+    if (btm_cb.ble_ctr_cb.bg_conn_type == BTM_BLE_CONN_SELECTIVE) {
+        //do nothing
+    } else {
+        if (p_inq_results_cb && (result & BTM_BLE_INQ_RESULT)) {
+            (p_inq_results_cb)((tBTM_INQ_RESULTS *) &p_i->inq_info.results, p_le_inq_cb->adv_data_cache);
+            p_le_inq_cb->adv_len = 0;
+            memset(p_le_inq_cb->adv_addr, 0, BD_ADDR_LEN);
+            p_i->inq_info.results.adv_data_len = 0;
+            p_i->inq_info.results.scan_rsp_len = 0;
+        }
+        if (p_obs_results_cb && (result & BTM_BLE_OBS_RESULT)) {
+            (p_obs_results_cb)((tBTM_INQ_RESULTS *) &p_i->inq_info.results, p_le_inq_cb->adv_data_cache);
+            p_le_inq_cb->adv_len = 0;
+            memset(p_le_inq_cb->adv_addr, 0, BD_ADDR_LEN);
+            p_i->inq_info.results.adv_data_len = 0;
+            p_i->inq_info.results.scan_rsp_len = 0;
+        }
+        if (p_scan_results_cb && (result & BTM_BLE_DISCO_RESULT)) {
+            (p_scan_results_cb)((tBTM_INQ_RESULTS *) &p_i->inq_info.results, p_le_inq_cb->adv_data_cache);
+            p_le_inq_cb->adv_len = 0;
+            memset(p_le_inq_cb->adv_addr, 0, BD_ADDR_LEN);
+            p_i->inq_info.results.adv_data_len = 0;
+            p_i->inq_info.results.scan_rsp_len = 0;
+        }
     }
 }
 
@@ -3060,6 +3153,13 @@ static void btm_ble_process_adv_pkt_cont(BD_ADDR bda, UINT8 addr_type, UINT8 evt
     tBTM_BLE_INQ_CB      *p_le_inq_cb = &btm_cb.ble_ctr_cb.inq_var;
     BOOLEAN     update = TRUE;
     UINT8       result = 0;
+
+   //if scan duplicate is enabled, the adv packet without scan response is allowed to report to upper layer
+   if(p_le_inq_cb->scan_duplicate_filter == BTM_BLE_SCAN_DUPLICATE_ENABLE) {
+       if(memcmp(bda, p_le_inq_cb->adv_addr, BD_ADDR_LEN) != 0) {
+            btm_ble_process_last_adv_pkt();
+       }
+   }
 
     p_i = btm_inq_db_find (bda);
 
@@ -3089,7 +3189,7 @@ static void btm_ble_process_adv_pkt_cont(BD_ADDR bda, UINT8 addr_type, UINT8 evt
         p_inq->inq_cmpl_info.num_resp++;
     }
     /* update the LE device information in inquiry database */
-    if (!btm_ble_update_inq_result(p_i, addr_type, evt_type, p)) {
+    if (!btm_ble_update_inq_result(bda, p_i, addr_type, evt_type, p)) {
         return;
     }
 
@@ -3133,12 +3233,24 @@ static void btm_ble_process_adv_pkt_cont(BD_ADDR bda, UINT8 addr_type, UINT8 evt
     } else {
         if (p_inq_results_cb && (result & BTM_BLE_INQ_RESULT)) {
             (p_inq_results_cb)((tBTM_INQ_RESULTS *) &p_i->inq_info.results, p_le_inq_cb->adv_data_cache);
+            p_le_inq_cb->adv_len = 0;
+            memset(p_le_inq_cb->adv_addr, 0, BD_ADDR_LEN);
+            p_i->inq_info.results.adv_data_len = 0;
+            p_i->inq_info.results.scan_rsp_len = 0;
         }
         if (p_obs_results_cb && (result & BTM_BLE_OBS_RESULT)) {
             (p_obs_results_cb)((tBTM_INQ_RESULTS *) &p_i->inq_info.results, p_le_inq_cb->adv_data_cache);
+            p_le_inq_cb->adv_len = 0;
+            memset(p_le_inq_cb->adv_addr, 0, BD_ADDR_LEN);
+            p_i->inq_info.results.adv_data_len = 0;
+            p_i->inq_info.results.scan_rsp_len = 0;
         }
         if (p_scan_results_cb && (result & BTM_BLE_DISCO_RESULT)) {
             (p_scan_results_cb)((tBTM_INQ_RESULTS *) &p_i->inq_info.results, p_le_inq_cb->adv_data_cache);
+            p_le_inq_cb->adv_len = 0;
+            memset(p_le_inq_cb->adv_addr, 0, BD_ADDR_LEN);
+            p_i->inq_info.results.adv_data_len = 0;
+            p_i->inq_info.results.scan_rsp_len = 0;
         }
     }
 }
@@ -3177,6 +3289,9 @@ tBTM_STATUS btm_ble_start_scan(void)
     tBTM_STATUS status = BTM_CMD_STARTED;
     // recoverly the scan parameters to the controller before start scan
     btm_ble_recover_scan_params();
+    if(p_inq->scan_duplicate_filter > BTM_BLE_DUPLICATE_MAX) {
+        p_inq->scan_duplicate_filter = BTM_BLE_DUPLICATE_DISABLE;
+    }
     /* start scan, disable duplicate filtering */
     if (!btsnd_hcic_ble_set_scan_enable (BTM_BLE_SCAN_ENABLE, p_inq->scan_duplicate_filter)) {
         status = BTM_NO_RESOURCES;

@@ -17,6 +17,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "sdkconfig.h"
+#include "esp_heap_caps.h"
 #include "esp_heap_caps_init.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -48,15 +50,18 @@
 #define BTDM_CFG_BT_DATA_RELEASE            (1<<0)
 #define BTDM_CFG_HCI_UART                   (1<<1)
 #define BTDM_CFG_CONTROLLER_RUN_APP_CPU     (1<<2)
+#define BTDM_CFG_SCAN_DUPLICATE_OPTIONS     (1<<3)
+#define BTDM_CFG_SEND_ADV_RESERVED_SIZE     (1<<4)
 /* Other reserved for future */
 
 /* not for user call, so don't put to include file */
 extern void btdm_osi_funcs_register(void *osi_funcs);
 extern int btdm_controller_init(uint32_t config_mask, esp_bt_controller_config_t *config_opts);
-extern int btdm_controller_deinit(void);
+extern void btdm_controller_deinit(void);
 extern int btdm_controller_enable(esp_bt_mode_t mode);
-extern int btdm_controller_disable(esp_bt_mode_t mode);
+extern void btdm_controller_disable(void);
 extern uint8_t btdm_controller_get_mode(void);
+extern const char *btdm_controller_get_compile_version(void);
 extern void btdm_rf_bb_init(void);
 
 /* VHCI function interface */
@@ -112,6 +117,17 @@ static btdm_dram_available_region_t btdm_dram_available_region[] = {
     {ESP_BT_MODE_BTDM,          0x3ffbdb28, 0x3ffc0000},
 };
 
+#if CONFIG_SPIRAM_USE_MALLOC
+typedef struct {
+    QueueHandle_t handle;
+    void *storage;
+    void *buffer;
+} btdm_queue_item_t;
+#define BTDM_MAX_QUEUE_NUM       (5)
+static btdm_queue_item_t btdm_queue_table[BTDM_MAX_QUEUE_NUM];
+SemaphoreHandle_t btdm_queue_table_mux = NULL;
+#endif /* #if CONFIG_SPIRAM_USE_MALLOC */
+
 struct osi_funcs_t {
     xt_handler (*_set_isr)(int n, xt_handler f, void *arg);
     void (*_ints_on)(unsigned int mask);
@@ -156,6 +172,52 @@ static portMUX_TYPE global_int_mux = portMUX_INITIALIZER_UNLOCKED;
 static esp_pm_lock_handle_t s_pm_lock;
 #endif
 
+#if CONFIG_SPIRAM_USE_MALLOC
+bool IRAM_ATTR btdm_queue_generic_register(const btdm_queue_item_t *queue)
+{
+    if (!btdm_queue_table_mux || !queue) {
+        return NULL;
+    }
+
+    bool ret = false;
+    btdm_queue_item_t *item;
+    xSemaphoreTake(btdm_queue_table_mux, portMAX_DELAY);
+    for (int i = 0; i < BTDM_MAX_QUEUE_NUM; ++i) {
+        item = &btdm_queue_table[i];
+        if (item->handle == NULL) {
+            memcpy(item, queue, sizeof(btdm_queue_item_t));
+            ret = true;
+            break;
+        }
+    }
+    xSemaphoreGive(btdm_queue_table_mux);
+    return ret;
+}
+
+bool IRAM_ATTR btdm_queue_generic_deregister(btdm_queue_item_t *queue)
+{
+    if (!btdm_queue_table_mux || !queue) {
+        return false;
+    }
+
+    bool ret = false;
+    btdm_queue_item_t *item;
+    xSemaphoreTake(btdm_queue_table_mux, portMAX_DELAY);
+    for (int i = 0; i < BTDM_MAX_QUEUE_NUM; ++i) {
+        item = &btdm_queue_table[i];
+        if (item->handle == queue->handle) {
+            memcpy(queue, item, sizeof(btdm_queue_item_t));
+            memset(item, 0, sizeof(btdm_queue_item_t));
+            ret = true;
+            break;
+        }
+    }
+    xSemaphoreGive(btdm_queue_table_mux);
+    return ret;
+}
+
+#endif /* CONFIG_SPIRAM_USE_MALLOC */
+
 static void IRAM_ATTR interrupt_disable(void)
 {
     portENTER_CRITICAL(&global_int_mux);
@@ -173,12 +235,63 @@ static void IRAM_ATTR task_yield_from_isr(void)
 
 static void *IRAM_ATTR semphr_create_wrapper(uint32_t max, uint32_t init)
 {
+#if !CONFIG_SPIRAM_USE_MALLOC
     return (void *)xSemaphoreCreateCounting(max, init);
+#else
+    StaticQueue_t *queue_buffer = NULL;
+    QueueHandle_t handle = NULL;
+
+    queue_buffer = heap_caps_malloc(sizeof(StaticQueue_t), MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
+    if (!queue_buffer) {
+        goto error;
+    }
+
+    handle = xSemaphoreCreateCountingStatic(max, init, queue_buffer);
+    if (!handle) {
+        goto error;
+    }
+
+    btdm_queue_item_t item = {
+        .handle = handle,
+        .storage = NULL,
+        .buffer = queue_buffer,
+    };
+
+    if (!btdm_queue_generic_register(&item)) {
+        goto error;
+    }
+    return handle;
+
+ error:
+    if (handle) {
+        vSemaphoreDelete(handle);
+    }
+    if (queue_buffer) {
+        free(queue_buffer);
+    }
+
+    return NULL;
+#endif
 }
 
 static void IRAM_ATTR semphr_delete_wrapper(void *semphr)
 {
+#if !CONFIG_SPIRAM_USE_MALLOC
     vSemaphoreDelete(semphr);
+#else
+    btdm_queue_item_t item = {
+        .handle = semphr,
+        .storage = NULL,
+        .buffer = NULL,
+    };
+
+    if (btdm_queue_generic_deregister(&item)) {
+        vSemaphoreDelete(item.handle);
+        free(item.buffer);
+    }
+
+    return;
+#endif
 }
 
 static int32_t IRAM_ATTR semphr_take_from_isr_wrapper(void *semphr, void *hptw)
@@ -207,12 +320,63 @@ static int32_t IRAM_ATTR semphr_give_wrapper(void *semphr)
 
 static void *IRAM_ATTR mutex_create_wrapper(void)
 {
+#if CONFIG_SPIRAM_USE_MALLOC
+    StaticQueue_t *queue_buffer = NULL;
+    QueueHandle_t handle = NULL;
+
+    queue_buffer = heap_caps_malloc(sizeof(StaticQueue_t), MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
+    if (!queue_buffer) {
+        goto error;
+    }
+
+    handle = xSemaphoreCreateMutexStatic(queue_buffer);
+    if (!handle) {
+        goto error;
+    }
+
+    btdm_queue_item_t item = {
+        .handle = handle,
+        .storage = NULL,
+        .buffer = queue_buffer,
+    };
+
+    if (!btdm_queue_generic_register(&item)) {
+        goto error;
+    }
+    return handle;
+
+ error:
+    if (handle) {
+        vSemaphoreDelete(handle);
+    }
+    if (queue_buffer) {
+        free(queue_buffer);
+    }
+
+    return NULL;
+#else
     return (void *)xSemaphoreCreateMutex();
+#endif
 }
 
 static void IRAM_ATTR mutex_delete_wrapper(void *mutex)
 {
+#if !CONFIG_SPIRAM_USE_MALLOC
     vSemaphoreDelete(mutex);
+#else
+    btdm_queue_item_t item = {
+        .handle = mutex,
+        .storage = NULL,
+        .buffer = NULL,
+    };
+
+    if (btdm_queue_generic_deregister(&item)) {
+        vSemaphoreDelete(item.handle);
+        free(item.buffer);
+    }
+
+    return;
+#endif
 }
 
 static int32_t IRAM_ATTR mutex_lock_wrapper(void *mutex)
@@ -227,12 +391,74 @@ static int32_t IRAM_ATTR mutex_unlock_wrapper(void *mutex)
 
 static void *IRAM_ATTR queue_create_wrapper(uint32_t queue_len, uint32_t item_size)
 {
+#if CONFIG_SPIRAM_USE_MALLOC
+    StaticQueue_t *queue_buffer = NULL;
+    uint8_t *queue_storage = NULL;
+    QueueHandle_t handle = NULL;
+
+    queue_buffer = heap_caps_malloc(sizeof(StaticQueue_t), MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
+    if (!queue_buffer) {
+        goto error;
+    }
+
+    queue_storage = heap_caps_malloc((queue_len*item_size), MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
+    if (!queue_storage ) {
+        goto error;
+    }
+
+    handle = xQueueCreateStatic(queue_len, item_size, queue_storage, queue_buffer);
+    if (!handle) {
+        goto error;
+    }
+
+    btdm_queue_item_t item = {
+        .handle = handle,
+        .storage = queue_storage,
+        .buffer = queue_buffer,
+    };
+
+    if (!btdm_queue_generic_register(&item)) {
+        goto error;
+    }
+
+    return handle;
+
+ error:
+    if (handle) {
+        vQueueDelete(handle);
+    }
+    if (queue_storage) {
+        free(queue_storage);
+    }
+    if (queue_buffer) {
+        free(queue_buffer);
+    }
+
+    return NULL;
+#else
     return (void *)xQueueCreate(queue_len, item_size);
+#endif
 }
 
 static void IRAM_ATTR queue_delete_wrapper(void *queue)
 {
+#if !CONFIG_SPIRAM_USE_MALLOC
     vQueueDelete(queue);
+#else
+    btdm_queue_item_t item = {
+        .handle = queue,
+        .storage = NULL,
+        .buffer = NULL,
+    };
+
+    if (btdm_queue_generic_deregister(&item)) {
+        vQueueDelete(item.handle);
+        free(item.storage);
+        free(item.buffer);
+    }
+
+    return;
+#endif
 }
 
 static int32_t IRAM_ATTR queue_send_wrapper(void *queue, void *item, uint32_t block_time_ms)
@@ -376,6 +602,10 @@ static uint32_t btdm_config_mask_load(void)
 #if CONFIG_BTDM_CONTROLLER_PINNED_TO_CORE == 1
     mask |= BTDM_CFG_CONTROLLER_RUN_APP_CPU;
 #endif
+    mask |= BTDM_CFG_SCAN_DUPLICATE_OPTIONS;
+
+    mask |= BTDM_CFG_SEND_ADV_RESERVED_SIZE;
+
     return mask;
 }
 
@@ -477,6 +707,20 @@ esp_err_t esp_bt_controller_init(esp_bt_controller_config_t *cfg)
     }
 #endif
 
+    ESP_LOGI(BTDM_LOG_TAG, "BT controller compile version [%s]\n", btdm_controller_get_compile_version());
+
+#if CONFIG_SPIRAM_USE_MALLOC
+    btdm_queue_table_mux = xSemaphoreCreateMutex();
+    if (btdm_queue_table == NULL) {
+#ifdef CONFIG_PM_ENABLE
+        esp_pm_lock_delete(s_pm_lock);
+        s_pm_lock = NULL;
+#endif
+        return ESP_ERR_NO_MEM;
+    }
+    memset(btdm_queue_table, 0, sizeof(btdm_queue_item_t) * BTDM_MAX_QUEUE_NUM);
+#endif
+
     btdm_osi_funcs_register(&osi_funcs);
 
     btdm_controller_mem_init();
@@ -504,11 +748,15 @@ esp_err_t esp_bt_controller_deinit(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (btdm_controller_deinit() != 0) {
-        return ESP_ERR_NO_MEM;
-    }
+    btdm_controller_deinit();
 
     periph_module_disable(PERIPH_BT_MODULE);
+
+#if CONFIG_SPIRAM_USE_MALLOC
+    vSemaphoreDelete(btdm_queue_table_mux);
+    btdm_queue_table_mux = NULL;
+    memset(btdm_queue_table, 0, sizeof(btdm_queue_item_t) * BTDM_MAX_QUEUE_NUM);
+#endif
 
     btdm_controller_status = ESP_BT_CONTROLLER_STATUS_IDLE;
 
@@ -556,21 +804,14 @@ esp_err_t esp_bt_controller_enable(esp_bt_mode_t mode)
 
 esp_err_t esp_bt_controller_disable(void)
 {
-    int ret;
-
     if (btdm_controller_status != ESP_BT_CONTROLLER_STATUS_ENABLED) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    ret = btdm_controller_disable(btdm_controller_get_mode());
-    if (ret < 0) {
-        return ESP_ERR_INVALID_STATE;
-    }
+    btdm_controller_disable();
 
-    if (ret == ESP_BT_MODE_IDLE) {
-        esp_phy_rf_deinit();
-        btdm_controller_status = ESP_BT_CONTROLLER_STATUS_INITED;
-    }
+    esp_phy_rf_deinit();
+    btdm_controller_status = ESP_BT_CONTROLLER_STATUS_INITED;
 
 #ifdef CONFIG_PM_ENABLE
     esp_pm_lock_release(s_pm_lock);

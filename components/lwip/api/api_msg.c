@@ -536,6 +536,9 @@ accept_function(void *arg, struct tcp_pcb *newpcb, err_t err)
      to the application thread */
   newconn->last_err = err;
 
+  /* handle backlog counter */
+  tcp_backlog_delayed(newpcb);
+
   if (sys_mbox_trypost(&conn->acceptmbox, newconn) != ERR_OK) {
     ESP_STATS_DROP_INC(esp.acceptmbox_post_fail);
     /* When returning != ERR_OK, the pcb is aborted in tcp_process(),
@@ -549,6 +552,9 @@ accept_function(void *arg, struct tcp_pcb *newpcb, err_t err)
     tcp_err(pcb, NULL);
     /* remove reference from to the pcb from this netconn */
     newconn->pcb.tcp = NULL;
+#if ESP_THREAD_SAFE
+    sys_mbox_set_owner(&newconn->recvmbox, NULL);
+#endif
     /* no need to drain since we know the recvmbox is empty. */
     sys_mbox_free(&newconn->recvmbox);
     sys_mbox_set_invalid(&newconn->recvmbox);
@@ -707,7 +713,15 @@ netconn_alloc(enum netconn_type t, netconn_callback callback)
   }
 #endif
 
+#if ESP_THREAD_SAFE
+  sys_mbox_set_owner(&conn->recvmbox, conn);
+#endif
+
 #if LWIP_TCP
+#if ESP_THREAD_SAFE
+  /* Init acceptmbox to NULL because sys_mbox_set_invalid is implemented as empty macro */
+  conn->acceptmbox = NULL;
+#endif
   sys_mbox_set_invalid(&conn->acceptmbox);
 #endif
   conn->state        = NETCONN_NONE;
@@ -750,12 +764,21 @@ void
 netconn_free(struct netconn *conn)
 {
   LWIP_ASSERT("PCB must be deallocated outside this function", conn->pcb.tcp == NULL);
+
+#if !ESP_THREAD_SAFE
   LWIP_ASSERT("recvmbox must be deallocated before calling this function",
     !sys_mbox_valid(&conn->recvmbox));
 #if LWIP_TCP
   LWIP_ASSERT("acceptmbox must be deallocated before calling this function",
     !sys_mbox_valid(&conn->acceptmbox));
 #endif /* LWIP_TCP */
+#else /* !ESP_THREAD_SAFE */
+  sys_mbox_free(&conn->recvmbox);
+
+#if LWIP_TCP
+  sys_mbox_free(&conn->acceptmbox);
+#endif
+#endif /* !ESP_THREAD_SAFE */
 
 #if !LWIP_NETCONN_SEM_PER_THREAD
   sys_sem_free(&conn->op_completed);
@@ -942,38 +965,33 @@ lwip_netconn_do_close_internal(struct netconn *conn  WRITE_DELAYED_PARAM SIG_CLO
 #endif /* LWIP_SO_LINGER */
   } else {
     if (err == ERR_MEM) {
-      /* Closing failed because of memory shortage */
-      if (netconn_is_nonblocking(conn)) {
-        /* Nonblocking close failed */
-        close_finished = 1;
-        err = ERR_WOULDBLOCK;
-      } else {
-        /* Blocking close, check the timeout */
+      /* Closing failed because of memory shortage, try again later. Even for
+         nonblocking netconns, we have to wait since no standard socket application
+         is prepared for close failing because of resource shortage.
+         Check the timeout: this is kind of an lwip addition to the standard sockets:
+         we wait for some time when failing to allocate a segment for the FIN */
 #if LWIP_SO_SNDTIMEO || LWIP_SO_LINGER
-        s32_t close_timeout = LWIP_TCP_CLOSE_TIMEOUT_MS_DEFAULT;
-        /* this is kind of an lwip addition to the standard sockets: we wait
-           for some time when failing to allocate a segment for the FIN */
+      s32_t close_timeout = LWIP_TCP_CLOSE_TIMEOUT_MS_DEFAULT;
 #if LWIP_SO_SNDTIMEO
-        if (conn->send_timeout > 0) {
-          close_timeout = conn->send_timeout;
-        }
+      if (conn->send_timeout > 0) {
+        close_timeout = conn->send_timeout;
+      }
 #endif /* LWIP_SO_SNDTIMEO */
 #if LWIP_SO_LINGER
-        if (conn->linger >= 0) {
-          /* use linger timeout (seconds) */
-          close_timeout = conn->linger * 1000U;
-        }
+      if (conn->linger >= 0) {
+        /* use linger timeout (seconds) */
+        close_timeout = conn->linger * 1000U;
+      }
 #endif
-        if ((s32_t)(sys_now() - conn->current_msg->msg.sd.time_started) >= close_timeout) {
+      if ((s32_t)(sys_now() - conn->current_msg->msg.sd.time_started) >= close_timeout) {
 #else /* LWIP_SO_SNDTIMEO || LWIP_SO_LINGER */
-        if (conn->current_msg->msg.sd.polls_left == 0) {
+      if (conn->current_msg->msg.sd.polls_left == 0) {
 #endif /* LWIP_SO_SNDTIMEO || LWIP_SO_LINGER */
-          close_finished = 1;
-          if (close) {
-            /* in this case, we want to RST the connection */
-            tcp_abort(tpcb);
-            err = ERR_OK;
-          }
+        close_finished = 1;
+        if (close) {
+          /* in this case, we want to RST the connection */
+          tcp_abort(tpcb);
+          err = ERR_OK;
         }
       }
     } else {
@@ -1401,6 +1419,9 @@ lwip_netconn_do_listen(void *m)
                 msg->err = sys_mbox_new(&msg->conn->acceptmbox, DEFAULT_ACCEPTMBOX_SIZE);
               }
               if (msg->err == ERR_OK) {
+#if ESP_THREAD_SAFE
+                sys_mbox_set_owner(&msg->conn->acceptmbox, msg->conn);
+#endif
                 msg->conn->state = NETCONN_LISTEN;
                 msg->conn->pcb.tcp = lpcb;
                 tcp_arg(msg->conn->pcb.tcp, msg->conn);
@@ -1503,23 +1524,37 @@ lwip_netconn_do_recv(void *m)
   msg->err = ERR_OK;
   if (msg->conn->pcb.tcp != NULL) {
     if (NETCONNTYPE_GROUP(msg->conn->type) == NETCONN_TCP) {
-#if TCP_LISTEN_BACKLOG
-      if (msg->conn->pcb.tcp->state == LISTEN) {
-        tcp_accepted(msg->conn->pcb.tcp);
-      } else
-#endif /* TCP_LISTEN_BACKLOG */
-      {
-        u32_t remaining = msg->msg.r.len;
-        do {
-          u16_t recved = (remaining > 0xffff) ? 0xffff : (u16_t)remaining;
-          tcp_recved(msg->conn->pcb.tcp, recved);
-          remaining -= recved;
-        } while (remaining != 0);
-      }
+      u32_t remaining = msg->msg.r.len;
+      do {
+        u16_t recved = (remaining > 0xffff) ? 0xffff : (u16_t)remaining;
+        tcp_recved(msg->conn->pcb.tcp, recved);
+        remaining -= recved;
+      } while (remaining != 0);
     }
   }
   TCPIP_APIMSG_ACK(msg);
 }
+
+#if TCP_LISTEN_BACKLOG
+/** Indicate that a TCP pcb has been accepted
+ * Called from netconn_accept
+ *
+ * @param m the api_msg pointing to the connection
+ */
+void
+lwip_netconn_do_accepted(void *m)
+{
+  struct api_msg_msg *msg = (struct api_msg_msg *)m;
+
+  msg->err = ERR_OK;
+  if (msg->conn->pcb.tcp != NULL) {
+    if (NETCONNTYPE_GROUP(msg->conn->type) == NETCONN_TCP) {
+      tcp_backlog_accepted(msg->conn->pcb.tcp);
+    }
+  }
+  TCPIP_APIMSG_ACK(msg);
+}
+#endif /* TCP_LISTEN_BACKLOG */
 
 /**
  * See if more data needs to be written from a previous call to netconn_write.

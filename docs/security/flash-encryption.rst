@@ -3,7 +3,9 @@ Flash Encryption
 
 Flash Encryption is a feature for encrypting the contents of the ESP32's attached SPI flash. When flash encryption is enabled, physical readout of the SPI flash is not sufficient to recover most flash contents.
 
-Flash Encryption is separate from the :doc:`Secure Boot <secure-boot>` feature, and you can use flash encryption without enabling secure boot. However we recommend using both features together for a secure environment.
+Flash Encryption is separate from the :doc:`Secure Boot <secure-boot>` feature, and you can use flash encryption without enabling secure boot. However, **for a secure environment both should be used simultaneously**. In absence of secure boot, additional configuration needs to be performed to ensure effectiveness of flash encryption. See :ref:`flash-encryption-without-secure-boot` for more details.
+
+When using any non-default configuration in production, additional steps may also be needed to ensure effectiveness of flash encryption. See :ref:`securing-flash-encryption` for more details.
 
 **IMPORTANT: Enabling flash encryption limits your options for further updates of your ESP32. Make sure to read this document (including :ref:`flash-encryption-limitations`) and understand the implications of enabling flash encryption.**
 
@@ -138,7 +140,7 @@ Limited Updates
 
 Only 4 serial flash update cycles of this kind are possible, including the initial encrypted flash.
 
-After the fourth time encryption is disabled, :ref:`FLASH_CRYPT_CNT` has the maximum value `0xFF` and encryption is permanently disabled.
+After the fourth time encryption is enabled, :ref:`FLASH_CRYPT_CNT` has the maximum value ``0x7F`` (7 bits set) and encryption is permanently enabled. 
 
 Using :ref:`updating-encrypted-flash-ota` or :ref:`pregenerated-flash-encryption-key` allows you to exceed this limit.
 
@@ -164,15 +166,7 @@ Serial Re-Flashing Procedure
 
 - Reset the device and it will re-encrypt plaintext partitions, then burn the :ref:`FLASH_CRYPT_CNT` again to re-enable encryption.
 
-
-Disabling Serial Updates
-~~~~~~~~~~~~~~~~~~~~~~~~
-
-To prevent further plaintext updates via serial, use espefuse.py to write protect the :ref:`FLASH_CRYPT_CNT` after flash encryption has been enabled (ie after first boot is complete)::
-
-    espefuse.py --port PORT write_protect_efuse FLASH_CRYPT_CNT
-
-This prevents any further modifications to disable or re-enable flash encryption.
+To prevent any further serial updates, see :ref:`securing-flash-encryption`.
 
 .. _pregenerated-flash-encryption-key:
 
@@ -260,7 +254,7 @@ Limitations of Flash Encryption
 
 Flash Encryption prevents plaintext readout of the encrypted flash, to protect firmware against unauthorised readout and modification. It is important to understand the limitations of the flash encryption system:
 
-- Flash encryption is only as strong as the key. For this reason, we recommend keys are generated on the device during first boot (default behaviour). If generating keys off-device (see :ref:`pregenerated-flash-encryption-key`), ensure proper procedure is followed.
+- Flash encryption is only as strong as the key. For this reason, we recommend keys are generated on the device during first boot (default behavior). If generating keys off-device (see :ref:`pregenerated-flash-encryption-key`), ensure proper procedure is followed.
 
 - Not all data is stored encrypted. If storing data on flash, check if the method you are using (library, API, etc.) supports flash encryption.
 
@@ -269,6 +263,26 @@ Flash Encryption prevents plaintext readout of the encrypted flash, to protect f
 - For the same reason, an attacker can always tell when a pair of adjacent 16 byte blocks (32 byte aligned) contain identical content. Keep this in mind if storing sensitive data on the flash, design your flash storage so this doesn't happen (using a counter byte or some other non-identical value every 16 bytes is sufficient).
 
 - Flash encryption alone may not prevent an attacker from modifying the firmware of the device. To prevent unauthorised firmware from runningon the device, use flash encryption in combination with :doc:`Secure Boot <secure-boot>`.
+
+.. _flash-encryption-without-secure-boot:
+.. _securing-flash-encryption:
+
+Securing Flash Encryption
+-------------------------
+
+In a production setting it's important to ensure that flash encryption cannot be temporarily disabled.
+
+This is because if the :doc:`secure-boot` feature is not enabled, or if Secure Boot is somehow bypassed by an attacker, then unauthorised code can be written to flash in plaintext. This code can then re-enable encryption and access encrypted data, making flash encryption ineffective.
+
+This problem must be avoided by write-protecting :ref:`FLASH_CRYPT_CNT` and thereby keeping flash encryption permanently enabled.
+
+The simplest way to do this is to enable the configuration option ``CONFIG_FLASH_ENCRYPTION_DISABLE_PLAINTEXT`` (enabled by default if Secure Boot is enabled). This option causes :ref:`FLASH_CRYPT_CNT` to be write protected during initial app startup, or during first boot when the bootloader enables flash encryption. This includes if an app with this option is OTA updated.
+
+Alternatively, :ref:`FLASH_CRYPT_CNT` can be write-protected using the serial bootloader::
+
+  espefuse.py --port PORT write_protect_efuse FLASH_CRYPT_CNT
+
+A third option with more flexibility: the app can call :func:`esp_flash_write_protect_crypt_cnt` at a convenient time during its startup or provisioning process, or set the ``FLASH_ENCRYPTION_DISABLE_PLAINTEXT`` config option for this to happen automatically.
 
 .. _flash-encryption-advanced-features:
 
@@ -348,9 +362,9 @@ The following sections provide some reference information about the operation of
 FLASH_CRYPT_CNT efuse
 ^^^^^^^^^^^^^^^^^^^^^
 
-``FLASH_CRYPT_CNT`` is an 8-bit efuse field which controls flash encryption. Flash encryption enables or disables based on the number of bits in this efuse which are set to "1":
+``FLASH_CRYPT_CNT`` is a 7-bit efuse field which controls flash encryption. Flash encryption enables or disables based on the number of bits in this efuse which are set to "1":
 
-- When an even number of bits (0,2,4,6,8) are set: Flash encryption is disabled, any encrypted data cannot be decrypted.
+- When an even number of bits (0,2,4,6) are set: Flash encryption is disabled, any encrypted data cannot be decrypted.
 
   - If the bootloader was built with "Enable flash encryption on boot" then it will see this situation and immediately re-encrypt the flash wherever it finds unencrypted data. Once done, it sets another bit in the efuse to '1' meaning an odd number of bits are now set.
 
@@ -361,7 +375,7 @@ FLASH_CRYPT_CNT efuse
 
 - When an odd number of bits (1,3,5,7) are set: Transparent reading of encrypted flash is enabled.
 
-- After all 8 bits are set (efuse value 0xFF): Transparent reading of encrypted flash is disabled, any encrypted data is permanently inaccessible. Bootloader will normally detect this condition and halt. To avoid use of this state to load unauthorised code, secure boot must be used or :ref:`FLASH_CRYPT_CNT` must be write-protected.
+- To avoid use of :ref:`FLASH_CRYPT_CNT` state to disable flash encryption, load unauthorised code, then re-enabled flash encryption, secure boot must be used or :ref:`FLASH_CRYPT_CNT` must be write-protected.
 
 
 .. _flash-encryption-algorithm:

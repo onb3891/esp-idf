@@ -968,6 +968,7 @@ void BTA_DmSetBleScanParams(tGATT_IF client_if, UINT32 scan_interval,
 **                  scan_interval - scan interval
 **                  scan_window - scan window
 **                  scan_mode - scan mode
+**                  scan_duplicate_filter - scan duplicate filter
 **                  scan_param_setup_status_cback - Set scan param status callback
 **
 ** Returns          void
@@ -975,7 +976,7 @@ void BTA_DmSetBleScanParams(tGATT_IF client_if, UINT32 scan_interval,
 *******************************************************************************/
 void BTA_DmSetBleScanFilterParams(tGATT_IF client_if, UINT32 scan_interval,
                                   UINT32 scan_window, tBLE_SCAN_MODE scan_mode, UINT8 scan_fil_poilcy,
-                                  UINT8 addr_type_own, tBLE_SCAN_PARAM_SETUP_CBACK scan_param_setup_cback)
+                                  UINT8 addr_type_own, UINT8 scan_duplicate_filter, tBLE_SCAN_PARAM_SETUP_CBACK scan_param_setup_cback)
 {
     tBTA_DM_API_BLE_SCAN_FILTER_PARAMS *p_msg;
 
@@ -987,6 +988,7 @@ void BTA_DmSetBleScanFilterParams(tGATT_IF client_if, UINT32 scan_interval,
         p_msg->scan_window = scan_window;
         p_msg->scan_mode = scan_mode;
         p_msg->addr_type_own = addr_type_own;
+        p_msg->scan_duplicate_filter = scan_duplicate_filter;
         p_msg->scan_filter_policy = scan_fil_poilcy;
         p_msg->scan_param_setup_cback = scan_param_setup_cback;
 
@@ -2284,12 +2286,12 @@ extern void BTA_DmBleStopAdvertising(void)
 ** Description      This function set the random address for the APP
 **
 ** Parameters       rand_addr: the random address whith should be setting
-**
+**                  p_set_rand_addr_cback: complete callback
 ** Returns          void
 **
 **
 *******************************************************************************/
-extern void BTA_DmSetRandAddress(BD_ADDR rand_addr)
+extern void BTA_DmSetRandAddress(BD_ADDR rand_addr, tBTA_SET_RAND_ADDR_CBACK *p_set_rand_addr_cback)
 {
     tBTA_DM_APT_SET_DEV_ADDR *p_msg;
     APPL_TRACE_API("set the random address ");
@@ -2298,6 +2300,7 @@ extern void BTA_DmSetRandAddress(BD_ADDR rand_addr)
         memcpy(p_msg->address, rand_addr, BD_ADDR_LEN);
         p_msg->hdr.event = BTA_DM_API_SET_RAND_ADDR_EVT;
         p_msg->addr_type = BLE_ADDR_RANDOM;
+        p_msg->p_set_rand_addr_cback = p_set_rand_addr_cback;
         //start sent the msg to the bta system control moudle
         bta_sys_sendmsg(p_msg);
     }

@@ -333,6 +333,16 @@ netif_set_addr(struct netif *netif, const ip4_addr_t *ipaddr, const ip4_addr_t *
 #endif /* LWIP_IPV4*/
 
 /**
+ * Set the netif flags for GARP
+ */
+#if ESP_GRATUITOUS_ARP
+void netif_set_garp_flag(struct netif *netif)
+{
+  netif->flags |= NETIF_FLAG_GARP;
+}
+#endif
+
+/**
  * Remove a network interface from the list of lwIP netifs.
  *
  * @param netif the network interface to remove
@@ -453,10 +463,10 @@ void
 netif_set_ipaddr(struct netif *netif, const ip4_addr_t *ipaddr)
 {
   ip4_addr_t new_addr = (ipaddr ? *ipaddr : *IP4_ADDR_ANY);
-#if ESP_LWIP
+#if ESP_TCP_KEEP_CONNECTION_WHEN_IP_CHANGES
   ip4_addr_t *last_addr = ip_2_ip4(&netif->last_ip_addr);
 #else
-  ip4_addr_t *last_addr = netif_ip4_addr(netif);
+  ip4_addr_t *last_addr = ip_2_ip4(&(netif->ip_addr));
 #endif
 
   /* address is actually being changed? */

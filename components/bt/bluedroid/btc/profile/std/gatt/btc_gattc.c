@@ -196,7 +196,7 @@ static void btc_gattc_app_unregister(btc_ble_gattc_args_t *arg)
 static void btc_gattc_open(btc_ble_gattc_args_t *arg)
 {
     tBTA_GATT_TRANSPORT transport = BTA_GATT_TRANSPORT_LE;
-    BTA_GATTC_Open(arg->open.gattc_if, arg->open.remote_bda, arg->open.is_direct, transport);
+    BTA_GATTC_Open(arg->open.gattc_if, arg->open.remote_bda, arg->open.remote_addr_type, arg->open.is_direct, transport);
 }
 
 static void btc_gattc_close(btc_ble_gattc_args_t *arg)
@@ -671,7 +671,7 @@ void btc_gattc_call_handler(btc_msg_t *msg)
     btc_ble_gattc_args_t *arg = (btc_ble_gattc_args_t *)(msg->arg);
     switch (msg->act) {
     case BTC_GATTC_ACT_APP_REGISTER:
-        LOG_ERROR("%s()", __func__);
+        LOG_DEBUG("%s()", __func__);
         btc_gattc_app_register(arg);
         break;
     case BTC_GATTC_ACT_APP_UNREGISTER:
@@ -914,8 +914,10 @@ void btc_gattc_cb_handler(btc_msg_t *msg)
         break;
     }
     case BTA_GATTC_SRVC_CHG_EVT: {
-        memcpy(param.srvc_chg.remote_bda, arg->remote_bda, sizeof(esp_bd_addr_t));
-        btc_gattc_cb_to_app(ESP_GATTC_SRVC_CHG_EVT, ESP_GATT_IF_NONE, &param);
+        tBTA_GATTC_SERVICE_CHANGE *srvc_change = &arg->srvc_chg;
+        gattc_if = BTC_GATT_GET_GATT_IF(srvc_change->conn_id);
+        memcpy(param.srvc_chg.remote_bda, srvc_change->remote_bda, sizeof(esp_bd_addr_t));
+        btc_gattc_cb_to_app(ESP_GATTC_SRVC_CHG_EVT, gattc_if, &param);
         break;
     }
     case BTA_GATTC_QUEUE_FULL_EVT: {

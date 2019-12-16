@@ -35,10 +35,16 @@
 #include "esp_err.h"
 #include "esp_wifi_types.h"
 #include "esp_event.h"
+#include "esp_wifi.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+typedef struct {
+    QueueHandle_t handle; /**< FreeRTOS queue handler */
+    void *storage;        /**< storage for FreeRTOS queue */
+} wifi_static_queue_t;
 
 /**
  * @brief Initialize Wi-Fi Driver
@@ -155,6 +161,15 @@ void *wifi_realloc( void *ptr, size_t size );
   * @return    A pointer to the memory allocated on success, NULL on failure
   */
 void *wifi_calloc( size_t n, size_t size );
+
+/**
+  * @brief     Update WiFi MAC time
+  *
+  * @param     uint32_t time_delta : time duration since the WiFi/BT common clock is disabled
+  *
+  * @return    Always returns ESP_OK
+  */
+esp_err_t esp_wifi_internal_update_mac_time( uint32_t time_delta );
 
 #ifdef __cplusplus
 }

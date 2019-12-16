@@ -55,8 +55,9 @@
 
 #define BTM_BLE_ENC_MASK    0x03
 
-#define BTM_BLE_DUPLICATE_ENABLE        1
 #define BTM_BLE_DUPLICATE_DISABLE       0
+#define BTM_BLE_DUPLICATE_ENABLE        1
+#define BTM_BLE_DUPLICATE_MAX           BTM_BLE_DUPLICATE_ENABLE
 
 #define BTM_BLE_GAP_DISC_SCAN_INT      18         /* Interval(scan_int) = 11.25 ms= 0x0010 * 0.625 ms */
 #define BTM_BLE_GAP_DISC_SCAN_WIN      18         /* scan_window = 11.25 ms= 0x0010 * 0.625 ms */
@@ -104,6 +105,7 @@ typedef UINT8   tBTM_BLE_SEC_REQ_ACT;
 #define BTM_VSC_CHIP_CAPABILITY_M_VERSION 95
 
 typedef enum {
+    BTM_BLE_IDLE,
     BTM_BLE_SCANNING,
     BTM_BLE_SCAN_PENDING,
     BTM_BLE_STOP_SCAN,
@@ -160,7 +162,7 @@ typedef struct {
 
     UINT8 adv_len;
     UINT8 adv_data_cache[BTM_BLE_CACHE_ADV_DATA_MAX];
-
+    BD_ADDR adv_addr;
     /* inquiry BD addr database */
     UINT8 num_bd_entries;
     UINT8 max_bd_entries;

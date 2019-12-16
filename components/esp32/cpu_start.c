@@ -67,6 +67,7 @@
 #include "esp_clk_internal.h"
 #include "esp_timer.h"
 #include "esp_pm.h"
+#include "esp_flash_encrypt.h"
 #include "pm_impl.h"
 #include "trax.h"
 
@@ -115,6 +116,7 @@ void IRAM_ATTR call_start_cpu0()
     RESET_REASON rst_reas[2];
 #endif
     cpu_configure_region_protection();
+    cpu_init_memctl();
 
     //Move exception vectors to IRAM
     asm volatile (\
@@ -219,6 +221,7 @@ void IRAM_ATTR call_start_cpu1()
 
     ets_set_appcpu_boot_addr(0);
     cpu_configure_region_protection();
+    cpu_init_memctl();
 
 #if CONFIG_CONSOLE_UART_NONE
     ets_install_putc1(NULL);
@@ -299,6 +302,11 @@ void start_cpu0_default(void)
 #endif
 #if CONFIG_DISABLE_BASIC_ROM_CONSOLE
     esp_efuse_disable_basic_rom_console();
+#endif
+#ifdef CONFIG_FLASH_ENCRYPTION_DISABLE_PLAINTEXT
+    if (esp_flash_encryption_enabled()) {
+        esp_flash_write_protect_crypt_cnt();
+    }
 #endif
     rtc_gpio_force_hold_dis_all();
     esp_vfs_dev_uart_register();

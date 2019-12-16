@@ -294,6 +294,12 @@
  */
 #define TCP_QUEUE_OOSEQ                 CONFIG_TCP_QUEUE_OOSEQ
 
+/**
+ * ESP_TCP_KEEP_CONNECTION_WHEN_IP_CHANGES==1: Keep TCP connection when IP changed
+ * scenario happens: 192.168.0.2 -> 0.0.0.0 -> 192.168.0.2 or 192.168.0.2 -> 0.0.0.0
+ */
+
+#define ESP_TCP_KEEP_CONNECTION_WHEN_IP_CHANGES  CONFIG_ESP_TCP_KEEP_CONNECTION_WHEN_IP_CHANGES 
 /*
  *     LWIP_EVENT_API==1: The user defines lwip_tcp_event() to receive all
  *         events (accept, sent, etc) that happen in the system.
@@ -726,6 +732,7 @@
 #define ESP_DHCP_TIMER                  1
 #define ESP_LWIP_LOGI(...)              ESP_LOGI("lwip", __VA_ARGS__)
 #define ESP_PING                        1
+#define ESP_GRATUITOUS_ARP              CONFIG_ESP_GRATUITOUS_ARP
 
 #define TCP_WND_DEFAULT                 CONFIG_TCP_WND_DEFAULT
 #define TCP_SND_BUF_DEFAULT             CONFIG_TCP_SND_BUF_DEFAULT

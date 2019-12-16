@@ -92,6 +92,7 @@ typedef enum {
     WIFI_REASON_AUTH_FAIL                = 202,
     WIFI_REASON_ASSOC_FAIL               = 203,
     WIFI_REASON_HANDSHAKE_TIMEOUT        = 204,
+    WIFI_REASON_CONNECTION_FAIL          = 205,
 } wifi_err_reason_t;
 
 typedef enum {
@@ -173,6 +174,8 @@ typedef struct {
     wifi_auth_mode_t    authmode;         /**< The weakest authmode to accept in the fast scan mode */
 }wifi_fast_scan_threshold_t;
 
+typedef wifi_fast_scan_threshold_t wifi_scan_threshold_t;    /**< wifi_fast_scan_threshold_t only used in fast scan mode once, now it enabled in all channel scan, the wifi_fast_scan_threshold_t will be remove in version 4.0 */
+
 typedef enum {
     WIFI_PS_NONE,    /**< No power save */
     WIFI_PS_MODEM,   /**< Modem power save */
@@ -209,7 +212,7 @@ typedef struct {
     uint8_t bssid[6];     /**< MAC address of target AP*/
     uint8_t channel;       /**< channel of target AP. Set to 1~13 to scan starting from the specified channel before connecting to AP. If the channel of AP is unknown, set it to 0.*/
     wifi_sort_method_t sort_method;    /**< sort the connect AP in the list by rssi or security mode */
-    wifi_fast_scan_threshold_t  threshold;     /**< When scan_method is set to WIFI_FAST_SCAN, only APs which have an auth mode that is more secure than the selected auth mode and a signal stronger than the minimum RSSI will be used. */
+    wifi_scan_threshold_t  threshold;     /**< When scan_method is set, only APs which have an auth mode that is more secure than the selected auth mode and a signal stronger than the minimum RSSI will be used. */
 } wifi_sta_config_t;
 
 /** @brief Configuration data for ESP32 AP or STA.
