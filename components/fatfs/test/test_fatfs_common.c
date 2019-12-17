@@ -16,8 +16,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <fcntl.h>
 #include <sys/time.h>
 #include <sys/unistd.h>
+#include <sys/stat.h>
+#include <errno.h>
+#include <utime.h>
 #include "unity.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -29,6 +33,7 @@
 #include "test_fatfs_common.h"
 
 const char* fatfs_test_hello_str = "Hello, World!\n";
+const char* fatfs_test_hello_str_utf = "世界，你好！\n";
 
 void test_fatfs_create_file_with_text(const char* name, const char* text)
 {
@@ -84,6 +89,99 @@ void test_fatfs_read_file(const char* filename)
     TEST_ASSERT_EQUAL(0, fclose(f));
 }
 
+void test_fatfs_read_file_utf_8(const char* filename)
+{
+    FILE* f = fopen(filename, "r");
+    TEST_ASSERT_NOT_NULL(f);
+    char buf[64] = { 0 };   //Doubled buffer size to allow for longer UTF-8 strings
+    int cb = fread(buf, 1, sizeof(buf), f);
+    TEST_ASSERT_EQUAL(strlen(fatfs_test_hello_str_utf), cb);
+    TEST_ASSERT_EQUAL(0, strcmp(fatfs_test_hello_str_utf, buf));
+    TEST_ASSERT_EQUAL(0, fclose(f));
+}
+
+void test_fatfs_pread_file(const char* filename)
+{
+    char buf[32] = { 0 };
+    const int fd = open(filename, O_RDONLY);
+    TEST_ASSERT_NOT_EQUAL(-1, fd);
+
+    int r = pread(fd, buf, sizeof(buf), 0); // it is a regular read() with offset==0
+    TEST_ASSERT_EQUAL(0, strcmp(fatfs_test_hello_str, buf));
+    TEST_ASSERT_EQUAL(strlen(fatfs_test_hello_str), r);
+
+    memset(buf, 0, sizeof(buf));
+    r = pread(fd, buf, sizeof(buf), 1); // offset==1
+    TEST_ASSERT_EQUAL(0, strcmp(fatfs_test_hello_str + 1, buf));
+    TEST_ASSERT_EQUAL(strlen(fatfs_test_hello_str) - 1, r);
+
+    memset(buf, 0, sizeof(buf));
+    r = pread(fd, buf, sizeof(buf), 5); // offset==5
+    TEST_ASSERT_EQUAL(0, strcmp(fatfs_test_hello_str + 5, buf));
+    TEST_ASSERT_EQUAL(strlen(fatfs_test_hello_str) - 5, r);
+
+    // regular read() should work now because pread() should not affect the current position in file
+
+    memset(buf, 0, sizeof(buf));
+    r = read(fd, buf, sizeof(buf)); // note that this is read() and not pread()
+    TEST_ASSERT_EQUAL(0, strcmp(fatfs_test_hello_str, buf));
+    TEST_ASSERT_EQUAL(strlen(fatfs_test_hello_str), r);
+
+    memset(buf, 0, sizeof(buf));
+    r = pread(fd, buf, sizeof(buf), 10); // offset==10
+    TEST_ASSERT_EQUAL(0, strcmp(fatfs_test_hello_str + 10, buf));
+    TEST_ASSERT_EQUAL(strlen(fatfs_test_hello_str) - 10, r);
+
+    memset(buf, 0, sizeof(buf));
+    r = pread(fd, buf, sizeof(buf), strlen(fatfs_test_hello_str) + 1); // offset to EOF
+    TEST_ASSERT_EQUAL(0, r);
+
+    TEST_ASSERT_EQUAL(0, close(fd));
+}
+
+static void test_pwrite(const char *filename, off_t offset, const char *msg)
+{
+    const int fd = open(filename, O_WRONLY);
+    TEST_ASSERT_NOT_EQUAL(-1, fd);
+
+    const off_t current_pos = lseek(fd, 0, SEEK_END); // O_APPEND is not the same - jumps to the end only before write()
+
+    const int r = pwrite(fd, msg, strlen(msg), offset);
+    TEST_ASSERT_EQUAL(strlen(msg), r);
+
+    TEST_ASSERT_EQUAL(current_pos, lseek(fd, 0, SEEK_CUR)); // pwrite should not move the pointer
+
+    TEST_ASSERT_EQUAL(0, close(fd));
+}
+
+static void test_file_content(const char *filename, const char *msg)
+{
+    char buf[32] = { 0 };
+    const int fd = open(filename, O_RDONLY);
+    TEST_ASSERT_NOT_EQUAL(-1, fd);
+
+    int r = read(fd, buf, sizeof(buf));
+    TEST_ASSERT_NOT_EQUAL(-1, r);
+    TEST_ASSERT_EQUAL(0, strcmp(msg, buf));
+
+    TEST_ASSERT_EQUAL(0, close(fd));
+}
+
+void test_fatfs_pwrite_file(const char *filename)
+{
+    int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC);
+    TEST_ASSERT_NOT_EQUAL(-1, fd);
+    TEST_ASSERT_EQUAL(0, close(fd));
+
+    test_pwrite(filename, 0, "Hello");
+    test_file_content(filename, "Hello");
+
+    test_pwrite(filename, strlen("Hello"), ", world!");
+    test_file_content(filename, "Hello, world!");
+    test_pwrite(filename, strlen("Hello, "), "Dolly");
+    test_file_content(filename, "Hello, Dolly!");
+}
+
 void test_fatfs_open_max_files(const char* filename_prefix, size_t files_count)
 {
     FILE** files = calloc(files_count, sizeof(FILE*));
@@ -125,6 +223,81 @@ void test_fatfs_lseek(const char* filename)
     TEST_ASSERT_EQUAL(0, fclose(f));
 }
 
+void test_fatfs_truncate_file(const char* filename)
+{
+    int read = 0;
+    int truncated_len = 0;
+
+    const char input[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    char output[sizeof(input)];
+
+    FILE* f = fopen(filename, "wb");
+
+    TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_EQUAL(strlen(input), fprintf(f, input));
+
+    TEST_ASSERT_EQUAL(0, fclose(f));
+
+
+    // Extending file beyond size is not supported
+    TEST_ASSERT_EQUAL(-1, truncate(filename, strlen(input) + 1));
+    TEST_ASSERT_EQUAL(errno, EPERM);
+
+    TEST_ASSERT_EQUAL(-1, truncate(filename, -1));
+    TEST_ASSERT_EQUAL(errno, EPERM);
+
+
+    // Truncating should succeed
+    const char truncated_1[] = "ABCDEFGHIJ";
+    truncated_len = strlen(truncated_1);
+
+    TEST_ASSERT_EQUAL(0, truncate(filename, truncated_len));
+
+    f = fopen(filename, "rb");
+    TEST_ASSERT_NOT_NULL(f);
+    
+    memset(output, 0, sizeof(output));
+    read = fread(output, 1, sizeof(output), f);
+    
+    TEST_ASSERT_EQUAL(truncated_len, read);
+    TEST_ASSERT_EQUAL_STRING_LEN(truncated_1, output, truncated_len);
+
+    TEST_ASSERT_EQUAL(0, fclose(f));
+
+
+    // Once truncated, the new file size should be the basis 
+    // whether truncation should succeed or not
+    TEST_ASSERT_EQUAL(-1, truncate(filename, truncated_len + 1));
+    TEST_ASSERT_EQUAL(EPERM, errno);
+
+    TEST_ASSERT_EQUAL(-1, truncate(filename, strlen(input)));
+    TEST_ASSERT_EQUAL(EPERM, errno);
+
+    TEST_ASSERT_EQUAL(-1, truncate(filename, strlen(input) + 1));
+    TEST_ASSERT_EQUAL(EPERM, errno);
+
+    TEST_ASSERT_EQUAL(-1, truncate(filename, -1));
+    TEST_ASSERT_EQUAL(EPERM, errno);
+
+
+    // Truncating a truncated file should succeed
+    const char truncated_2[] = "ABCDE";
+    truncated_len = strlen(truncated_2);
+
+    TEST_ASSERT_EQUAL(0, truncate(filename, truncated_len));
+
+    f = fopen(filename, "rb");
+    TEST_ASSERT_NOT_NULL(f);
+    
+    memset(output, 0, sizeof(output));
+    read = fread(output, 1, sizeof(output), f);
+    
+    TEST_ASSERT_EQUAL(truncated_len, read);
+    TEST_ASSERT_EQUAL_STRING_LEN(truncated_2, output, truncated_len);
+
+    TEST_ASSERT_EQUAL(0, fclose(f));
+}
+
 void test_fatfs_stat(const char* filename, const char* root_dir)
 {
     struct tm tm;
@@ -158,6 +331,81 @@ void test_fatfs_stat(const char* filename, const char* root_dir)
     TEST_ASSERT_FALSE(st.st_mode & S_IFREG);
 }
 
+void test_fatfs_utime(const char* filename, const char* root_dir)
+{
+    struct stat achieved_stat;
+    struct tm desired_tm;
+    struct utimbuf desired_time = {
+        .actime = 0, // access time is not supported
+        .modtime = 0,
+    };
+    time_t false_now = 0;
+    memset(&desired_tm, 0, sizeof(struct tm));
+
+    {
+        // Setting up a false actual time - used when the file is created and for modification with the current time
+        desired_tm.tm_mon = 10 - 1;
+        desired_tm.tm_mday = 31;
+        desired_tm.tm_year = 2018 - 1900;
+        desired_tm.tm_hour = 10;
+        desired_tm.tm_min = 35;
+        desired_tm.tm_sec = 23;
+
+        false_now = mktime(&desired_tm);
+
+        struct timeval now = { .tv_sec = false_now };
+        settimeofday(&now, NULL);
+    }
+    test_fatfs_create_file_with_text(filename, "");
+
+    // 00:00:00. January 1st, 1980 - FATFS cannot handle earlier dates
+    desired_tm.tm_mon = 1 - 1;
+    desired_tm.tm_mday = 1;
+    desired_tm.tm_year = 1980 - 1900;
+    desired_tm.tm_hour = 0;
+    desired_tm.tm_min = 0;
+    desired_tm.tm_sec = 0;
+    printf("Testing mod. time: %s", asctime(&desired_tm));
+    desired_time.modtime = mktime(&desired_tm);
+    TEST_ASSERT_EQUAL(0, utime(filename, &desired_time));
+    TEST_ASSERT_EQUAL(0, stat(filename, &achieved_stat));
+    TEST_ASSERT_EQUAL_UINT32(desired_time.modtime, achieved_stat.st_mtime);
+
+    // current time
+    TEST_ASSERT_EQUAL(0, utime(filename, NULL));
+    TEST_ASSERT_EQUAL(0, stat(filename, &achieved_stat));
+    printf("Mod. time changed to (false actual time): %s", ctime(&achieved_stat.st_mtime));
+    TEST_ASSERT_NOT_EQUAL(desired_time.modtime, achieved_stat.st_mtime);
+    TEST_ASSERT(false_now - achieved_stat.st_mtime <= 2); // two seconds of tolerance are given
+
+    // 23:59:08. December 31st, 2037
+    desired_tm.tm_mon = 12 - 1;
+    desired_tm.tm_mday = 31;
+    desired_tm.tm_year = 2037 - 1900;
+    desired_tm.tm_hour = 23;
+    desired_tm.tm_min = 59;
+    desired_tm.tm_sec = 8;
+    printf("Testing mod. time: %s", asctime(&desired_tm));
+    desired_time.modtime = mktime(&desired_tm);
+    TEST_ASSERT_EQUAL(0, utime(filename, &desired_time));
+    TEST_ASSERT_EQUAL(0, stat(filename, &achieved_stat));
+    TEST_ASSERT_EQUAL_UINT32(desired_time.modtime, achieved_stat.st_mtime);
+
+    //WARNING: it has the Unix Millenium bug (Y2K38)
+
+    // 00:00:00. January 1st, 1970 - FATFS cannot handle years before 1980
+    desired_tm.tm_mon = 1 - 1;
+    desired_tm.tm_mday = 1;
+    desired_tm.tm_year = 1970 - 1900;
+    desired_tm.tm_hour = 0;
+    desired_tm.tm_min = 0;
+    desired_tm.tm_sec = 0;
+    printf("Testing mod. time: %s", asctime(&desired_tm));
+    desired_time.modtime = mktime(&desired_tm);
+    TEST_ASSERT_EQUAL(-1, utime(filename, &desired_time));
+    TEST_ASSERT_EQUAL(EINVAL, errno);
+}
+
 void test_fatfs_unlink(const char* filename)
 {
     test_fatfs_create_file_with_text(filename, "unlink\n");
@@ -182,7 +430,7 @@ void test_fatfs_link_rename(const char* filename_prefix)
 
     FILE* f = fopen(name_src, "w+");
     TEST_ASSERT_NOT_NULL(f);
-    char* str = "0123456789";
+    const char* str = "0123456789";
     for (int i = 0; i < 4000; ++i) {
         TEST_ASSERT_NOT_EQUAL(EOF, fputs(str, f));
     }
@@ -337,6 +585,85 @@ void test_fatfs_opendir_readdir_rewinddir(const char* dir_prefix)
     TEST_ASSERT_EQUAL(0, closedir(dir));
 }
 
+void test_fatfs_opendir_readdir_rewinddir_utf_8(const char* dir_prefix)
+{
+    char name_dir_inner_file[64];
+    char name_dir_inner[64];
+    char name_dir_file3[64];
+    char name_dir_file2[64];
+    char name_dir_file1[64];
+
+    snprintf(name_dir_inner_file, sizeof(name_dir_inner_file), "%s/内部目录/内部文件.txt", dir_prefix);
+    snprintf(name_dir_inner, sizeof(name_dir_inner), "%s/内部目录", dir_prefix);
+    snprintf(name_dir_file3, sizeof(name_dir_file3), "%s/文件三.bin", dir_prefix);
+    snprintf(name_dir_file2, sizeof(name_dir_file2), "%s/文件二.txt", dir_prefix);
+    snprintf(name_dir_file1, sizeof(name_dir_file1), "%s/文件一.txt", dir_prefix);
+
+    unlink(name_dir_inner_file);
+    rmdir(name_dir_inner);
+    unlink(name_dir_file1);
+    unlink(name_dir_file2);
+    unlink(name_dir_file3);
+    rmdir(dir_prefix);
+
+    TEST_ASSERT_EQUAL(0, mkdir(dir_prefix, 0755));
+    test_fatfs_create_file_with_text(name_dir_file1, "一号\n");
+    test_fatfs_create_file_with_text(name_dir_file2, "二号\n");
+    test_fatfs_create_file_with_text(name_dir_file3, "\0一\0二\0三");
+    TEST_ASSERT_EQUAL(0, mkdir(name_dir_inner, 0755));
+    test_fatfs_create_file_with_text(name_dir_inner_file, "三号\n");
+
+    DIR* dir = opendir(dir_prefix);
+    TEST_ASSERT_NOT_NULL(dir);
+    int count = 0;
+    const char* names[4];
+    while(count < 4) {
+        struct dirent* de = readdir(dir);
+        if (!de) {
+            break;
+        }
+        printf("found '%s'\n", de->d_name);
+        if (strcasecmp(de->d_name, "文件一.txt") == 0) {
+            TEST_ASSERT_TRUE(de->d_type == DT_REG);
+            names[count] = "文件一.txt";
+            ++count;
+        } else if (strcasecmp(de->d_name, "文件二.txt") == 0) {
+            TEST_ASSERT_TRUE(de->d_type == DT_REG);
+            names[count] = "文件二.txt";
+            ++count;
+        } else if (strcasecmp(de->d_name, "内部目录") == 0) {
+            TEST_ASSERT_TRUE(de->d_type == DT_DIR);
+            names[count] = "内部目录";
+            ++count;
+        } else if (strcasecmp(de->d_name, "文件三.bin") == 0) {
+            TEST_ASSERT_TRUE(de->d_type == DT_REG);
+            names[count] = "文件三.bin";
+            ++count;
+        } else {
+            TEST_FAIL_MESSAGE("unexpected directory entry");
+        }
+    }
+    TEST_ASSERT_EQUAL(count, 4);
+
+    rewinddir(dir);
+    struct dirent* de = readdir(dir);
+    TEST_ASSERT_NOT_NULL(de);
+    TEST_ASSERT_EQUAL(0, strcasecmp(de->d_name, names[0]));
+    seekdir(dir, 3);
+    de = readdir(dir);
+    TEST_ASSERT_NOT_NULL(de);
+    TEST_ASSERT_EQUAL(0, strcasecmp(de->d_name, names[3]));
+    seekdir(dir, 1);
+    de = readdir(dir);
+    TEST_ASSERT_NOT_NULL(de);
+    TEST_ASSERT_EQUAL(0, strcasecmp(de->d_name, names[1]));
+    seekdir(dir, 2);
+    de = readdir(dir);
+    TEST_ASSERT_NOT_NULL(de);
+    TEST_ASSERT_EQUAL(0, strcasecmp(de->d_name, names[2]));
+
+    TEST_ASSERT_EQUAL(0, closedir(dir));
+}
 
 typedef struct {
     const char* filename;
@@ -411,8 +738,9 @@ void test_fatfs_concurrent(const char* filename_prefix)
 
     const int cpuid_0 = 0;
     const int cpuid_1 = portNUM_PROCESSORS - 1;
-    xTaskCreatePinnedToCore(&read_write_task, "rw1", 2048, &args1, 3, NULL, cpuid_0);
-    xTaskCreatePinnedToCore(&read_write_task, "rw2", 2048, &args2, 3, NULL, cpuid_1);
+    const int stack_size = 4096;
+    xTaskCreatePinnedToCore(&read_write_task, "rw1", stack_size, &args1, 3, NULL, cpuid_0);
+    xTaskCreatePinnedToCore(&read_write_task, "rw2", stack_size, &args2, 3, NULL, cpuid_1);
 
     xSemaphoreTake(args1.done, portMAX_DELAY);
     printf("f1 done\n");
@@ -428,10 +756,10 @@ void test_fatfs_concurrent(const char* filename_prefix)
 
     printf("reading f1 and f2, writing f3 and f4\n");
 
-    xTaskCreatePinnedToCore(&read_write_task, "rw3", 2048, &args3, 3, NULL, cpuid_1);
-    xTaskCreatePinnedToCore(&read_write_task, "rw4", 2048, &args4, 3, NULL, cpuid_0);
-    xTaskCreatePinnedToCore(&read_write_task, "rw1", 2048, &args1, 3, NULL, cpuid_0);
-    xTaskCreatePinnedToCore(&read_write_task, "rw2", 2048, &args2, 3, NULL, cpuid_1);
+    xTaskCreatePinnedToCore(&read_write_task, "rw3", stack_size, &args3, 3, NULL, cpuid_1);
+    xTaskCreatePinnedToCore(&read_write_task, "rw4", stack_size, &args4, 3, NULL, cpuid_0);
+    xTaskCreatePinnedToCore(&read_write_task, "rw1", stack_size, &args1, 3, NULL, cpuid_0);
+    xTaskCreatePinnedToCore(&read_write_task, "rw2", stack_size, &args2, 3, NULL, cpuid_1);
 
     xSemaphoreTake(args1.done, portMAX_DELAY);
     printf("f1 done\n");
@@ -452,21 +780,20 @@ void test_fatfs_concurrent(const char* filename_prefix)
     vSemaphoreDelete(args4.done);
 }
 
-
-void test_fatfs_rw_speed(const char* filename, void* buf, size_t buf_size, size_t file_size, bool write)
+void test_fatfs_rw_speed(const char* filename, void* buf, size_t buf_size, size_t file_size, bool is_write)
 {
     const size_t buf_count = file_size / buf_size;
 
-    FILE* f = fopen(filename, (write) ? "wb" : "rb");
+    FILE* f = fopen(filename, (is_write) ? "wb" : "rb");
     TEST_ASSERT_NOT_NULL(f);
 
     struct timeval tv_start;
     gettimeofday(&tv_start, NULL);
     for (size_t n = 0; n < buf_count; ++n) {
-        if (write) {
-            TEST_ASSERT_EQUAL(1, fwrite(buf, buf_size, 1, f));
+        if (is_write) {
+            TEST_ASSERT_EQUAL(buf_size, write(fileno(f), buf, buf_size));
         } else {
-            if (fread(buf, buf_size, 1, f) != 1) {
+            if (read(fileno(f), buf, buf_size) != buf_size) {
                 printf("reading at n=%d, eof=%d", n, feof(f));
                 TEST_FAIL();
             }
@@ -480,7 +807,6 @@ void test_fatfs_rw_speed(const char* filename, void* buf, size_t buf_size, size_
 
     float t_s = tv_end.tv_sec - tv_start.tv_sec + 1e-6f * (tv_end.tv_usec - tv_start.tv_usec);
     printf("%s %d bytes (block size %d) in %.3fms (%.3f MB/s)\n",
-            (write)?"Wrote":"Read", file_size, buf_size, t_s * 1e3,
+            (is_write)?"Wrote":"Read", file_size, buf_size, t_s * 1e3,
                     file_size / (1024.0f * 1024.0f * t_s));
 }
-

@@ -32,7 +32,7 @@ static const char* TAG = "example";
 #define MOUNT_PATH "/data"
 #define HISTORY_PATH MOUNT_PATH "/history.txt"
 
-static void initialize_filesystem()
+static void initialize_filesystem(void)
 {
     static wl_handle_t wl_handle;
     const esp_vfs_fat_mount_config_t mount_config = {
@@ -41,39 +41,53 @@ static void initialize_filesystem()
     };
     esp_err_t err = esp_vfs_fat_spiflash_mount(MOUNT_PATH, "storage", &mount_config, &wl_handle);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to mount FATFS (0x%x)", err);
+        ESP_LOGE(TAG, "Failed to mount FATFS (%s)", esp_err_to_name(err));
         return;
     }
 }
 #endif // CONFIG_STORE_HISTORY
 
-static void initialize_nvs()
+static void initialize_nvs(void)
 {
     esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES) {
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK( nvs_flash_erase() );
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
 }
 
-static void initialize_console()
+static void initialize_console(void)
 {
-    /* Disable buffering on stdin and stdout */
+    /* Drain stdout before reconfiguring it */
+    fflush(stdout);
+    fsync(fileno(stdout));
+
+    /* Disable buffering on stdin */
     setvbuf(stdin, NULL, _IONBF, 0);
-    setvbuf(stdout, NULL, _IONBF, 0);
 
     /* Minicom, screen, idf_monitor send CR when ENTER key is pressed */
     esp_vfs_dev_uart_set_rx_line_endings(ESP_LINE_ENDINGS_CR);
     /* Move the caret to the beginning of the next line on '\n' */
     esp_vfs_dev_uart_set_tx_line_endings(ESP_LINE_ENDINGS_CRLF);
 
+    /* Configure UART. Note that REF_TICK is used so that the baud rate remains
+     * correct while APB frequency is changing in light sleep mode.
+     */
+    const uart_config_t uart_config = {
+            .baud_rate = CONFIG_ESP_CONSOLE_UART_BAUDRATE,
+            .data_bits = UART_DATA_8_BITS,
+            .parity = UART_PARITY_DISABLE,
+            .stop_bits = UART_STOP_BITS_1,
+            .source_clk = UART_SCLK_REF_TICK,
+    };
     /* Install UART driver for interrupt-driven reads and writes */
-    ESP_ERROR_CHECK( uart_driver_install(CONFIG_CONSOLE_UART_NUM,
+    ESP_ERROR_CHECK( uart_driver_install(CONFIG_ESP_CONSOLE_UART_NUM,
             256, 0, 0, NULL, 0) );
+    ESP_ERROR_CHECK( uart_param_config(CONFIG_ESP_CONSOLE_UART_NUM, &uart_config) );
 
     /* Tell VFS to use UART driver */
-    esp_vfs_dev_uart_use_driver(CONFIG_CONSOLE_UART_NUM);
+    esp_vfs_dev_uart_use_driver(CONFIG_ESP_CONSOLE_UART_NUM);
 
     /* Initialize the console */
     esp_console_config_t console_config = {
@@ -104,12 +118,15 @@ static void initialize_console()
 #endif
 }
 
-void app_main()
+void app_main(void)
 {
     initialize_nvs();
 
 #if CONFIG_STORE_HISTORY
     initialize_filesystem();
+    ESP_LOGI(TAG, "Command history enabled");
+#else
+    ESP_LOGI(TAG, "Command history disabled");
 #endif
 
     initialize_console();
@@ -118,6 +135,7 @@ void app_main()
     esp_console_register_help_command();
     register_system();
     register_wifi();
+    register_nvs();
 
     /* Prompt to be printed before each line.
      * This can be customized, made dynamic, etc.
@@ -170,9 +188,9 @@ void app_main()
         } else if (err == ESP_ERR_INVALID_ARG) {
             // command was empty
         } else if (err == ESP_OK && ret != ESP_OK) {
-            printf("Command returned non-zero error code: 0x%x\n", ret);
+            printf("Command returned non-zero error code: 0x%x (%s)\n", ret, esp_err_to_name(ret));
         } else if (err != ESP_OK) {
-            printf("Internal error: 0x%x\n", err);
+            printf("Internal error: %s\n", esp_err_to_name(err));
         }
         /* linenoise allocates line buffer on the heap, so need to free it */
         linenoiseFree(line);

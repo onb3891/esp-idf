@@ -65,6 +65,7 @@ TEST_CASE("test time functions", "[newlib]")
 {
     time_t now = 1464248488;
     setenv("TZ", "UTC-8", 1);
+    tzset();
     struct tm *tm_utc = gmtime(&now);
     TEST_ASSERT_EQUAL( 28, tm_utc->tm_sec);
     TEST_ASSERT_EQUAL( 41, tm_utc->tm_min);
@@ -115,7 +116,7 @@ TEST_CASE("test asctime", "[newlib]")
     TEST_ASSERT_EQUAL_STRING(buf, time_str);
 }
 
-static bool fn_in_rom(void *fn, char *name)
+static bool fn_in_rom(void *fn, const char *name)
 {
     const int fnaddr = (int)fn;
     return (fnaddr >= 0x40000000) && (fnaddr < 0x40070000);
@@ -124,15 +125,20 @@ static bool fn_in_rom(void *fn, char *name)
 
 TEST_CASE("check if ROM or Flash is used for functions", "[newlib]")
 {
-#ifdef CONFIG_NEWLIB_NANO_FORMAT
+#if defined(CONFIG_NEWLIB_NANO_FORMAT) && !defined(CONFIG_SPIRAM)
     TEST_ASSERT(fn_in_rom(printf, "printf"));
     TEST_ASSERT(fn_in_rom(sscanf, "sscanf"));
 #else
     TEST_ASSERT_FALSE(fn_in_rom(printf, "printf"));
     TEST_ASSERT_FALSE(fn_in_rom(sscanf, "sscanf"));
 #endif
+#if !defined(CONFIG_SPIRAM)
     TEST_ASSERT(fn_in_rom(atoi,   "atoi"));
     TEST_ASSERT(fn_in_rom(strtol, "strtol"));
+#else
+    TEST_ASSERT_FALSE(fn_in_rom(atoi,   "atoi"));
+    TEST_ASSERT_FALSE(fn_in_rom(strtol, "strtol"));
+#endif
 }
 
 #ifndef CONFIG_NEWLIB_NANO_FORMAT
@@ -175,4 +181,9 @@ TEST_CASE("fmod and fmodf work as expected", "[newlib]")
 {
     TEST_ASSERT_EQUAL(0.1, fmod(10.1, 2.0));
     TEST_ASSERT_EQUAL(0.1f, fmodf(10.1f, 2.0f));
+}
+
+TEST_CASE("newlib: can link 'system', 'raise'", "[newlib]")
+{
+    printf("system: %p, raise: %p\n", &system, &raise);
 }

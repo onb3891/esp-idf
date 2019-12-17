@@ -15,10 +15,9 @@
 #include "driver/adc.h"
 #include "driver/dac.h"
 #include "esp_system.h"
-#include "esp_adc_cal.h"
 
-#define DAC_EXAMPLE_CHANNEL     CONFIG_DAC_EXAMPLE_CHANNEL
-#define ADC2_EXAMPLE_CHANNEL    CONFIG_ADC2_EXAMPLE_CHANNEL
+#define DAC_EXAMPLE_CHANNEL     CONFIG_EXAMPLE_DAC_CHANNEL
+#define ADC2_EXAMPLE_CHANNEL    CONFIG_EXAMPLE_ADC2_CHANNEL
 
 void app_main(void)
 {
@@ -28,11 +27,13 @@ void app_main(void)
 
     gpio_num_t adc_gpio_num, dac_gpio_num;
 
-    assert( adc2_pad_get_io_num( ADC2_EXAMPLE_CHANNEL, &adc_gpio_num ) == ESP_OK );
-    assert( dac_pad_get_io_num( DAC_EXAMPLE_CHANNEL, &dac_gpio_num ) == ESP_OK );
+    r = adc2_pad_get_io_num( ADC2_EXAMPLE_CHANNEL, &adc_gpio_num );
+    assert( r == ESP_OK );
+    r = dac_pad_get_io_num( DAC_EXAMPLE_CHANNEL, &dac_gpio_num );
+    assert( r == ESP_OK );
 
-    printf("ADC channel %d @ GPIO %d, DAC channel %d @ GPIO %d.\n", ADC2_EXAMPLE_CHANNEL, adc_gpio_num,
-                DAC_EXAMPLE_CHANNEL, dac_gpio_num );
+    printf("ADC2 channel %d @ GPIO %d, DAC channel %d @ GPIO %d.\n", ADC2_EXAMPLE_CHANNEL, adc_gpio_num,
+                DAC_EXAMPLE_CHANNEL + 1, dac_gpio_num );
 
     dac_output_enable( DAC_EXAMPLE_CHANNEL );
 
@@ -49,11 +50,14 @@ void app_main(void)
         if ( r == ESP_OK ) {
             printf("%d: %d\n", output_data, read_raw );
         } else if ( r == ESP_ERR_INVALID_STATE ) {
-            printf("ADC2 not initialized yet.\n");
+            printf("%s: ADC2 not initialized yet.\n", esp_err_to_name(r));
         } else if ( r == ESP_ERR_TIMEOUT ) {
             //This can not happen in this example. But if WiFi is in use, such error code could be returned.
-            printf("ADC2 is in use by Wi-Fi.\n");
+            printf("%s: ADC2 is in use by Wi-Fi.\n", esp_err_to_name(r));
+        } else {
+            printf("%s\n", esp_err_to_name(r));
         }
+
         vTaskDelay( 2 * portTICK_PERIOD_MS );
     }
 }

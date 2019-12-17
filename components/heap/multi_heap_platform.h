@@ -16,22 +16,26 @@
 #ifdef ESP_PLATFORM
 
 #include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
-#include <rom/ets_sys.h>
+#include "sdkconfig.h"
+#if CONFIG_IDF_TARGET_ESP32
+#include "esp32/rom/ets_sys.h"
+#elif CONFIG_IDF_TARGET_ESP32S2BETA
+#include "esp32s2beta/rom/ets_sys.h"
+#endif
 #include <assert.h>
 
 /* Because malloc/free can happen inside an ISR context,
    we need to use portmux spinlocks here not RTOS mutexes */
 #define MULTI_HEAP_LOCK(PLOCK) do {               \
         if((PLOCK) != NULL) {                               \
-            taskENTER_CRITICAL((portMUX_TYPE *)(PLOCK));    \
+            portENTER_CRITICAL((portMUX_TYPE *)(PLOCK));    \
         }                                                   \
     } while(0)
 
 
 #define MULTI_HEAP_UNLOCK(PLOCK) do {                \
         if ((PLOCK) != NULL) {                              \
-            taskEXIT_CRITICAL((portMUX_TYPE *)(PLOCK));     \
+            portEXIT_CRITICAL((portMUX_TYPE *)(PLOCK));     \
         }                                                   \
     } while(0)
 
@@ -49,9 +53,9 @@ inline static void multi_heap_assert(bool condition, const char *format, int lin
     */
 #ifndef NDEBUG
     if(!condition) {
-#ifndef CONFIG_OPTIMIZATION_ASSERTIONS_SILENT
+#ifndef CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT
         ets_printf(format, line, address);
-#endif  // CONFIG_OPTIMIZATION_ASSERTIONS_SILENT
+#endif  // CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT
         abort();
     }
 #else // NDEBUG
@@ -63,6 +67,17 @@ inline static void multi_heap_assert(bool condition, const char *format, int lin
     multi_heap_assert((CONDITION), "CORRUPT HEAP: multi_heap.c:%d detected at 0x%08x\n", \
                       __LINE__, (intptr_t)(ADDRESS))
 
+#ifdef CONFIG_HEAP_TASK_TRACKING
+#include <freertos/task.h>
+#define MULTI_HEAP_BLOCK_OWNER TaskHandle_t task;
+#define MULTI_HEAP_SET_BLOCK_OWNER(HEAD) (HEAD)->task = xTaskGetCurrentTaskHandle()
+#define MULTI_HEAP_GET_BLOCK_OWNER(HEAD) ((HEAD)->task)
+#else
+#define MULTI_HEAP_BLOCK_OWNER
+#define MULTI_HEAP_SET_BLOCK_OWNER(HEAD)
+#define MULTI_HEAP_GET_BLOCK_OWNER(HEAD) (NULL)
+#endif
+
 #else // ESP_PLATFORM
 
 #include <assert.h>
@@ -73,4 +88,9 @@ inline static void multi_heap_assert(bool condition, const char *format, int lin
 #define MULTI_HEAP_UNLOCK(PLOCK)
 
 #define MULTI_HEAP_ASSERT(CONDITION, ADDRESS) assert((CONDITION) && "Heap corrupt")
+
+#define MULTI_HEAP_BLOCK_OWNER
+#define MULTI_HEAP_SET_BLOCK_OWNER(HEAD)
+#define MULTI_HEAP_GET_BLOCK_OWNER(HEAD) (NULL)
+
 #endif

@@ -1,4 +1,4 @@
-// Copyright 2015-2016 Espressif Systems (Shanghai) PTE LTD
+// Copyright 2015-2019 Espressif Systems (Shanghai) PTE LTD
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,10 +15,10 @@
 #ifndef _DRIVER_I2C_H_
 #define _DRIVER_I2C_H_
 
-
 #ifdef __cplusplus
 extern "C" {
 #endif
+
 #include <esp_types.h>
 #include "esp_err.h"
 #include "esp_intr_alloc.h"
@@ -29,74 +29,14 @@ extern "C" {
 #include "freertos/queue.h"
 #include "freertos/ringbuf.h"
 #include "driver/gpio.h"
+#include "hal/i2c_types.h"
+#include "soc/i2c_caps.h"
 
 #define I2C_APB_CLK_FREQ  APB_CLK_FREQ /*!< I2C source clock is APB clock, 80MHz */
-#define I2C_FIFO_LEN   (32)  /*!< I2C hardware fifo length */
-typedef enum{
-    I2C_MODE_SLAVE = 0,   /*!< I2C slave mode */
-    I2C_MODE_MASTER,      /*!< I2C master mode */
-    I2C_MODE_MAX,
-}i2c_mode_t;
 
-typedef enum {
-    I2C_MASTER_WRITE = 0,   /*!< I2C write data */
-    I2C_MASTER_READ,        /*!< I2C read data */
-} i2c_rw_t;
-
-typedef enum {
-    I2C_DATA_MODE_MSB_FIRST = 0,  /*!< I2C data msb first */
-    I2C_DATA_MODE_LSB_FIRST = 1,  /*!< I2C data lsb first */
-    I2C_DATA_MODE_MAX
-} i2c_trans_mode_t;
-
-typedef enum{
-    I2C_CMD_RESTART = 0,   /*!<I2C restart command */
-    I2C_CMD_WRITE,         /*!<I2C write command */
-    I2C_CMD_READ,          /*!<I2C read command */
-    I2C_CMD_STOP,          /*!<I2C stop command */
-    I2C_CMD_END            /*!<I2C end command */
-}i2c_opmode_t;
-
-typedef enum{
-    I2C_NUM_0 = 0,  /*!< I2C port 0 */
-    I2C_NUM_1 ,     /*!< I2C port 1 */
-    I2C_NUM_MAX
-} i2c_port_t;
-
-typedef enum {
-    I2C_ADDR_BIT_7 = 0,    /*!< I2C 7bit address for slave mode */
-    I2C_ADDR_BIT_10,       /*!< I2C 10bit address for slave mode */
-    I2C_ADDR_BIT_MAX,
-} i2c_addr_mode_t;
-
-typedef enum {
-    I2C_MASTER_ACK = 0x0,        /*!< I2C ack for each byte read */
-    I2C_MASTER_NACK = 0x1,       /*!< I2C nack for each byte read */
-    I2C_MASTER_LAST_NACK = 0x2,   /*!< I2C nack for the last byte*/
-    I2C_MASTER_ACK_MAX,
-} i2c_ack_type_t;
-
-/**
- * @brief I2C initialization parameters
- */
-typedef struct{
-    i2c_mode_t mode;       /*!< I2C mode */
-    gpio_num_t sda_io_num;        /*!< GPIO number for I2C sda signal */
-    gpio_pullup_t sda_pullup_en;  /*!< Internal GPIO pull mode for I2C sda signal*/
-    gpio_num_t scl_io_num;        /*!< GPIO number for I2C scl signal */
-    gpio_pullup_t scl_pullup_en;  /*!< Internal GPIO pull mode for I2C scl signal*/
-
-    union {
-        struct {
-            uint32_t clk_speed;     /*!< I2C clock frequency for master mode, (no higher than 1MHz for now) */
-        } master;
-        struct {
-            uint8_t addr_10bit_en;  /*!< I2C 10bit address mode enable for slave mode */
-            uint16_t slave_addr;    /*!< I2C address for slave mode */
-        } slave;
-
-    };
-}i2c_config_t;
+#define I2C_NUM_0              (0) /*!< I2C port 0 */
+#define I2C_NUM_1              (1) /*!< I2C port 1 */
+#define I2C_NUM_MAX            (SOC_I2C_NUM) /*!< I2C port max */
 
 typedef void* i2c_cmd_handle_t;    /*!< I2C command handle  */
 
@@ -113,6 +53,10 @@ typedef void* i2c_cmd_handle_t;    /*!< I2C command handle  */
  *        Only slave mode will use this value, driver will ignore this value in master mode.
  * @param intr_alloc_flags Flags used to allocate the interrupt. One or multiple (ORred)
  *            ESP_INTR_FLAG_* values. See esp_intr_alloc.h for more info.
+ *        @note
+ *        In master mode, if the cache is likely to be disabled(such as write flash) and the slave is time-sensitive,
+ *        `ESP_INTR_FLAG_IRAM` is suggested to be used. In this case, please use the memory allocated from internal RAM in i2c read and write function,
+ *        because we can not access the psram(if psram is enabled) in interrupt handle function when cache is disabled.
  *
  * @return
  *     - ESP_OK   Success
@@ -208,7 +152,7 @@ esp_err_t i2c_isr_free(intr_handle_t handle);
  *     - ESP_ERR_INVALID_ARG Parameter error
  */
 esp_err_t i2c_set_pin(i2c_port_t i2c_num, int sda_io_num, int scl_io_num,
-                      gpio_pullup_t sda_pullup_en, gpio_pullup_t scl_pullup_en, i2c_mode_t mode);
+                      bool sda_pullup_en, bool scl_pullup_en, i2c_mode_t mode);
 
 /**
  * @brief Create and init I2C command link
@@ -220,7 +164,7 @@ esp_err_t i2c_set_pin(i2c_port_t i2c_num, int sda_io_num, int scl_io_num,
  *
  * @return i2c command link handler
  */
-i2c_cmd_handle_t i2c_cmd_link_create();
+i2c_cmd_handle_t i2c_cmd_link_create(void);
 
 /**
  * @brief Free I2C command link
@@ -272,6 +216,8 @@ esp_err_t i2c_master_write_byte(i2c_cmd_handle_t cmd_handle, uint8_t data, bool 
  *
  * @param cmd_handle I2C cmd link
  * @param data data to send
+ *        @note
+ *        If the psram is enabled and intr_flag is `ESP_INTR_FLAG_IRAM`, please use the memory allocated from internal RAM.
  * @param data_len data length
  * @param ack_en enable ack check for master
  *
@@ -289,6 +235,8 @@ esp_err_t i2c_master_write(i2c_cmd_handle_t cmd_handle, uint8_t* data, size_t da
  *
  * @param cmd_handle I2C cmd link
  * @param data pointer accept the data byte
+ *        @note
+ *        If the psram is enabled and intr_flag is `ESP_INTR_FLAG_IRAM`, please use the memory allocated from internal RAM.
  * @param ack ack value for read command
  *
  * @return
@@ -305,6 +253,8 @@ esp_err_t i2c_master_read_byte(i2c_cmd_handle_t cmd_handle, uint8_t* data, i2c_a
  *
  * @param cmd_handle I2C cmd link
  * @param data data buffer to accept the data from bus
+ *        @note
+ *        If the psram is enabled and intr_flag is `ESP_INTR_FLAG_IRAM`, please use the memory allocated from internal RAM.
  * @param data_len read data length
  * @param ack ack value for read command
  *
@@ -374,7 +324,7 @@ int i2c_slave_write_buffer(i2c_port_t i2c_num, uint8_t* data, int size, TickType
  *        Only call this function in I2C slave mode
  *
  * @param i2c_num I2C port number
- * @param data data pointer to write into internal buffer
+ * @param data data pointer to accept data from internal buffer
  * @param max_size Maximum data size to read
  * @param ticks_to_wait Maximum waiting ticks
  *
@@ -409,6 +359,35 @@ esp_err_t i2c_set_period(i2c_port_t i2c_num, int high_period, int low_period);
  *     - ESP_ERR_INVALID_ARG Parameter error
  */
 esp_err_t i2c_get_period(i2c_port_t i2c_num, int* high_period, int* low_period);
+
+/**
+ * @brief enable hardware filter on I2C bus
+ *        Sometimes the I2C bus is disturbed by high frequency noise(about 20ns), or the rising edge of
+ *        the SCL clock is very slow, these may cause the master state machine broken. enable hardware
+ *        filter can filter out high frequency interference and make the master more stable.
+ *        @note
+ *        Enable filter will slow the SCL clock.
+ *
+ * @param i2c_num I2C port number
+ * @param cyc_num the APB cycles need to be filtered(0<= cyc_num <=7).
+ *        When the period of a pulse is less than cyc_num * APB_cycle, the I2C controller will ignore this pulse.
+ *
+ * @return
+ *     - ESP_OK Success
+ *     - ESP_ERR_INVALID_ARG Parameter error
+ */
+esp_err_t i2c_filter_enable(i2c_port_t i2c_num, uint8_t cyc_num);
+
+/**
+ * @brief disable filter on I2C bus
+ *
+ * @param i2c_num I2C port number
+ *
+ * @return
+ *     - ESP_OK Success
+ *     - ESP_ERR_INVALID_ARG Parameter error
+ */
+esp_err_t i2c_filter_disable(i2c_port_t i2c_num);
 
 /**
  * @brief set I2C master start signal timing
@@ -507,6 +486,7 @@ esp_err_t i2c_set_timeout(i2c_port_t i2c_num, int timeout);
  *     - ESP_ERR_INVALID_ARG Parameter error
  */
 esp_err_t i2c_get_timeout(i2c_port_t i2c_num, int* timeout);
+
 /**
  * @brief set I2C data transfer mode
  *

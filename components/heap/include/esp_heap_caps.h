@@ -67,7 +67,7 @@ void *heap_caps_malloc(size_t size, uint32_t caps);
 void heap_caps_free( void *ptr);
 
 /**
- * @brief Reallocate memory previously allocated via heap_caps_malloc() or heaps_caps_realloc().
+ * @brief Reallocate memory previously allocated via heap_caps_malloc() or heap_caps_realloc().
  *
  * Equivalent semantics to libc realloc(), for capability-aware memory.
  *
@@ -90,7 +90,7 @@ void *heap_caps_realloc( void *ptr, size_t size, int caps);
  *
  * Equivalent semantics to libc calloc(), for capability-aware memory.
  *
- * In IDF, ``calloc(p)`` is equivalent to ``heaps_caps_calloc(p, MALLOC_CAP_8BIT)``.
+ * In IDF, ``calloc(p)`` is equivalent to ``heap_caps_calloc(p, MALLOC_CAP_8BIT)``.
  *
  * @param n    Number of continuing chunks of memory to allocate
  * @param size Size, in bytes, of a chunk of memory to allocate
@@ -100,6 +100,20 @@ void *heap_caps_realloc( void *ptr, size_t size, int caps);
  * @return A pointer to the memory allocated on success, NULL on failure
  */
 void *heap_caps_calloc(size_t n, size_t size, uint32_t caps);
+
+/**
+ * @brief Get the total size of all the regions that have the given capabilities
+ *
+ * This function takes all regions capable of having the given capabilities allocated in them
+ * and adds up the total space they have.
+ *
+ * @param caps        Bitwise OR of MALLOC_CAP_* flags indicating the type
+ *                    of memory
+ *
+ * @return total size in bytes
+ */
+
+size_t heap_caps_get_total_size(uint32_t caps);
 
 /**
  * @brief Get the total free size of all the regions that have the given capabilities
@@ -308,7 +322,20 @@ void heap_caps_dump(uint32_t caps);
  * Output is the same as for heap_caps_dump.
  *
  */
-void heap_caps_dump_all();
+void heap_caps_dump_all(void);
+
+/**
+ * @brief Return the size that a particular pointer was allocated with.
+ *
+ * @param ptr Pointer to currently allocated heap memory. Must be a pointer value previously 
+ * returned by heap_caps_malloc,malloc,calloc, etc. and not yet freed.
+ *
+ * @note The app will crash with an assertion failure if the pointer is not valid.
+ * 
+ * @return Size of the memory allocated at this block.
+ * 
+ */
+size_t heap_caps_get_allocated_size( void *ptr );
 
 #ifdef __cplusplus
 }

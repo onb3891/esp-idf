@@ -61,7 +61,7 @@ PORTMUX_AQUIRE_MUX_FN_NAME(portMUX_TYPE *mux, int timeout_cycles) {
 
 #ifdef CONFIG_FREERTOS_PORTMUX_DEBUG
 	uint32_t owner = mux->owner;
-	if (owner != portMUX_FREE_VAL && owner != CORE_ID_PRO && owner != CORE_ID_APP) {
+	if (owner != portMUX_FREE_VAL && owner != CORE_ID_REGVAL_PRO && owner != CORE_ID_REGVAL_APP) {
 		ets_printf("ERROR: vPortCPUAcquireMutex: mux %p is uninitialized (0x%X)! Called from %s line %d.\n", mux, owner, fnName, line);
 		mux->owner=portMUX_FREE_VAL;
 	}
@@ -70,13 +70,13 @@ PORTMUX_AQUIRE_MUX_FN_NAME(portMUX_TYPE *mux, int timeout_cycles) {
 	/* Spin until we own the core */
 
 	RSR(PRID, coreID);
-	/* Note: coreID is the full 32 bit core ID (CORE_ID_PRO/CORE_ID_APP),
+	/* Note: coreID is the full 32 bit core ID (CORE_ID_REGVAL_PRO/CORE_ID_REGVAL_APP),
 	   not the 0/1 value returned by xPortGetCoreID()
 	*/
-	otherCoreID = CORE_ID_XOR_SWAP ^ coreID;
+	otherCoreID = CORE_ID_REGVAL_XOR_SWAP ^ coreID;
 	do {
-		/* mux->owner should be one of portMUX_FREE_VAL, CORE_ID_PRO,
-		   CORE_ID_APP:
+		/* mux->owner should be one of portMUX_FREE_VAL, CORE_ID_REGVAL_PRO,
+		   CORE_ID_REGVAL_APP:
 
 		   - If portMUX_FREE_VAL, we want to atomically set to 'coreID'.
 		   - If "our" coreID, we can drop through immediately.
@@ -138,7 +138,7 @@ static inline void PORTMUX_RELEASE_MUX_FN_NAME(portMUX_TYPE *mux) {
 	mux->lastLockedFn=fnName;
 	mux->lastLockedLine=line;
 	uint32_t owner = mux->owner;
-	if (owner != portMUX_FREE_VAL && owner != CORE_ID_PRO && owner != CORE_ID_APP) {
+	if (owner != portMUX_FREE_VAL && owner != CORE_ID_REGVAL_PRO && owner != CORE_ID_REGVAL_APP) {
 		ets_printf("ERROR: vPortCPUReleaseMutex: mux %p is invalid (0x%x)!\n", mux, mux->owner);
 	}
 #endif
@@ -155,17 +155,15 @@ static inline void PORTMUX_RELEASE_MUX_FN_NAME(portMUX_TYPE *mux) {
 #endif
 
 	assert(coreID == mux->owner); // This is a mutex we didn't lock, or it's corrupt
-	assert(mux->count > 0); // Indicates memory corruption
-	assert(mux->count < 0x100); // Indicates memory corruption
 
 	mux->count--;
 	if(mux->count == 0) {
 		mux->owner = portMUX_FREE_VAL;
-	}
+	} else {
+		assert(mux->count < 0x100); // Indicates memory corruption
 #ifdef CONFIG_FREERTOS_PORTMUX_DEBUG_RECURSIVE
-	else {
 		ets_printf("Recursive unlock: count=%d last locked %s line %d, curr %s line %d\n", mux->count, lastLockedFn, lastLockedLine, fnName, line);
-	}
 #endif
+	}
 #endif //!CONFIG_FREERTOS_UNICORE
 }

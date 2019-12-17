@@ -73,18 +73,24 @@ extern "C" {
 #ifndef __ASSEMBLER__
 
 #include <stdint.h>
+#include <stdlib.h>
+#include <stdbool.h>
 
-#include <xtensa/tie/xt_core.h>
 #include <xtensa/hal.h>
 #include <xtensa/config/core.h>
 #include <xtensa/config/system.h>	/* required for XSHAL_CLIB */
 #include <xtensa/xtruntime.h>
-#include "esp_crosscore_int.h"
+#include "esp_private/crosscore_int.h"
 #include "esp_timer.h"              /* required for FreeRTOS run time stats */
 
 
 #include <esp_heap_caps.h>
+
+#include "sdkconfig.h"
+
+#ifdef CONFIG_LEGACY_INCLUDE_COMMON_HEADERS
 #include "soc/soc_memory_layout.h"
+#endif
 
 //#include "xtensa_context.h"
 
@@ -130,11 +136,15 @@ typedef unsigned portBASE_TYPE	UBaseType_t;
 /* "mux" data structure (spinlock) */
 typedef struct {
 	/* owner field values:
-	 * 0                - Uninitialized (invalid)
+	 * 0				- Uninitialized (invalid)
 	 * portMUX_FREE_VAL - Mux is free, can be locked by either CPU
-	 * CORE_ID_PRO / CORE_ID_APP - Mux is locked to the particular core
+	 * CORE_ID_REGVAL_PRO / CORE_ID_REGVAL_APP - Mux is locked to the particular core
 	 *
-	 * Any value other than portMUX_FREE_VAL, CORE_ID_PRO, CORE_ID_APP indicates corruption
+	 * Note that for performance reasons we use the full Xtensa CORE ID values
+	 * (CORE_ID_REGVAL_PRO, CORE_ID_REGVAL_APP) and not the 0,1 values which are used in most
+	 * other FreeRTOS code.
+	 *
+	 * Any value other than portMUX_FREE_VAL, CORE_ID_REGVAL_PRO, CORE_ID_REGVAL_APP indicates corruption
 	 */
 	uint32_t owner;
 	/* count field:
@@ -171,7 +181,7 @@ typedef struct {
 
 
 #define portASSERT_IF_IN_ISR()        vPortAssertIfInISR()
-void vPortAssertIfInISR();
+void vPortAssertIfInISR(void);
 
 #define portCRITICAL_NESTING_IN_TCB 1
 
@@ -198,7 +208,7 @@ This all assumes that interrupts are either entirely disabled or enabled. Interr
 will break this scheme.
 
 Remark: For the ESP32, portENTER_CRITICAL and portENTER_CRITICAL_ISR both alias vTaskEnterCritical, meaning
-that either function can be called both from ISR as well as task context. This is not standard FreeRTOS 
+that either function can be called both from ISR as well as task context. This is not standard FreeRTOS
 behaviour; please keep this in mind if you need any compatibility with other FreeRTOS implementations.
 */
 void vPortCPUInitializeMutex(portMUX_TYPE *mux);
@@ -210,8 +220,34 @@ void vPortCPUReleaseMutex(portMUX_TYPE *mux, const char *function, int line);
 
 void vTaskEnterCritical( portMUX_TYPE *mux, const char *function, int line );
 void vTaskExitCritical( portMUX_TYPE *mux, const char *function, int line );
+
+#ifdef CONFIG_FREERTOS_CHECK_PORT_CRITICAL_COMPLIANCE
+/* Calling port*_CRITICAL from ISR context would cause an assert failure.
+ * If the parent function is called from both ISR and Non-ISR context then call port*_CRITICAL_SAFE
+ */
+#define portENTER_CRITICAL(mux)        do {                                                                                             \
+                                            if(!xPortInIsrContext()) {                                                                  \
+                                                vTaskEnterCritical(mux, __FUNCTION__, __LINE__);                                        \
+                                            } else {                                                                                    \
+                                                ets_printf("%s:%d (%s)- port*_CRITICAL called from ISR context!\n", __FILE__, __LINE__, \
+                                                           __FUNCTION__);                                                               \
+                                                abort();                                                                                \
+                                            }                                                                                           \
+                                       } while(0)
+
+#define portEXIT_CRITICAL(mux)        do {                                                                                              \
+                                            if(!xPortInIsrContext()) {                                                                  \
+                                                vTaskExitCritical(mux, __FUNCTION__, __LINE__);                                         \
+                                            } else {                                                                                    \
+                                                ets_printf("%s:%d (%s)- port*_CRITICAL called from ISR context!\n", __FILE__, __LINE__, \
+                                                           __FUNCTION__);                                                               \
+                                                abort();                                                                                \
+                                            }                                                                                           \
+                                       } while(0)
+#else
 #define portENTER_CRITICAL(mux)        vTaskEnterCritical(mux, __FUNCTION__, __LINE__)
 #define portEXIT_CRITICAL(mux)         vTaskExitCritical(mux, __FUNCTION__, __LINE__)
+#endif
 #define portENTER_CRITICAL_ISR(mux)    vTaskEnterCritical(mux, __FUNCTION__, __LINE__)
 #define portEXIT_CRITICAL_ISR(mux)     vTaskExitCritical(mux, __FUNCTION__, __LINE__)
 #else
@@ -230,11 +266,53 @@ void vPortCPUAcquireMutex(portMUX_TYPE *mux);
 bool vPortCPUAcquireMutexTimeout(portMUX_TYPE *mux, int timeout_cycles);
 void vPortCPUReleaseMutex(portMUX_TYPE *mux);
 
+#ifdef CONFIG_FREERTOS_CHECK_PORT_CRITICAL_COMPLIANCE
+/* Calling port*_CRITICAL from ISR context would cause an assert failure.
+ * If the parent function is called from both ISR and Non-ISR context then call port*_CRITICAL_SAFE
+ */
+#define portENTER_CRITICAL(mux)        do {                                                                                             \
+                                            if(!xPortInIsrContext()) {                                                                  \
+                                                vTaskEnterCritical(mux);                                                                \
+                                            } else {                                                                                    \
+                                                ets_printf("%s:%d (%s)- port*_CRITICAL called from ISR context!\n", __FILE__, __LINE__, \
+                                                           __FUNCTION__);                                                               \
+                                                abort();                                                                                \
+                                            }                                                                                           \
+                                       } while(0)
+
+#define portEXIT_CRITICAL(mux)        do {                                                                                              \
+                                            if(!xPortInIsrContext()) {                                                                  \
+                                                vTaskExitCritical(mux);                                                                 \
+                                            } else {                                                                                    \
+                                                ets_printf("%s:%d (%s)- port*_CRITICAL called from ISR context!\n", __FILE__, __LINE__, \
+                                                           __FUNCTION__);                                                               \
+                                                abort();                                                                                \
+                                            }                                                                                           \
+                                       } while(0)
+#else
 #define portENTER_CRITICAL(mux)        vTaskEnterCritical(mux)
 #define portEXIT_CRITICAL(mux)         vTaskExitCritical(mux)
+#endif
 #define portENTER_CRITICAL_ISR(mux)    vTaskEnterCritical(mux)
 #define portEXIT_CRITICAL_ISR(mux)     vTaskExitCritical(mux)
 #endif
+
+#define portENTER_CRITICAL_SAFE(mux)  do {                                             \
+                                         if (xPortInIsrContext()) {                    \
+                                             portENTER_CRITICAL_ISR(mux);              \
+                                         } else {                                      \
+                                             portENTER_CRITICAL(mux);                  \
+                                         }                                             \
+                                      } while(0)
+
+#define portEXIT_CRITICAL_SAFE(mux)  do {                                              \
+                                         if (xPortInIsrContext()) {                    \
+                                             portEXIT_CRITICAL_ISR(mux);               \
+                                         } else {                                      \
+                                             portEXIT_CRITICAL(mux);                   \
+                                         }                                             \
+                                      } while(0)
+
 
 // Critical section management. NW-TODO: replace XTOS_SET_INTLEVEL with more efficient version, if any?
 // These cannot be nested. They should be used with a lot of care and cannot be called from interrupt level.
@@ -246,7 +324,7 @@ void vPortCPUReleaseMutex(portMUX_TYPE *mux);
 // Cleaner solution allows nested interrupts disabling and restoring via local registers or stack.
 // They can be called from interrupts too.
 // WARNING: Only applies to current CPU. See notes above.
-static inline unsigned portENTER_CRITICAL_NESTED() {
+static inline unsigned portENTER_CRITICAL_NESTED(void) {
 	unsigned state = XTOS_SET_INTLEVEL(XCHAL_EXCM_LEVEL);
 	portbenchmarkINTERRUPT_DISABLE();
 	return state;
@@ -259,16 +337,11 @@ static inline unsigned portENTER_CRITICAL_NESTED() {
 
 //Because the ROM routines don't necessarily handle a stack in external RAM correctly, we force
 //the stack memory to always be internal.
-#define pvPortMallocTcbMem(size) heap_caps_malloc(size, MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT)
-#define pvPortMallocStackMem(size)  heap_caps_malloc(size, MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT)
+#define portTcbMemoryCaps (MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT)
+#define portStackMemoryCaps (MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT)
 
-//xTaskCreateStatic uses these functions to check incoming memory.
-#define portVALID_TCB_MEM(ptr) (esp_ptr_internal(ptr) && esp_ptr_byte_accessible(ptr))
-#ifdef CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY
-#define portVALID_STACK_MEM(ptr) esp_ptr_byte_accessible(ptr)
-#else
-#define portVALID_STACK_MEM(ptr) (esp_ptr_internal(ptr) && esp_ptr_byte_accessible(ptr))
-#endif
+#define pvPortMallocTcbMem(size) heap_caps_malloc(size, portTcbMemoryCaps)
+#define pvPortMallocStackMem(size)  heap_caps_malloc(size, portStackMemoryCaps)
 
 /*
  * Wrapper for the Xtensa compare-and-set instruction. This subroutine will atomically compare
@@ -280,12 +353,30 @@ static inline unsigned portENTER_CRITICAL_NESTED() {
  * ESP32 (portMUX assertions would fail).
  */
 static inline void uxPortCompareSet(volatile uint32_t *addr, uint32_t compare, uint32_t *set) {
+#if XCHAL_HAVE_S32C1I
     __asm__ __volatile__ (
         "WSR 	    %2,SCOMPARE1 \n"
         "S32C1I     %0, %1, 0	 \n"
         :"=r"(*set)
         :"r"(addr), "r"(compare), "0"(*set)
         );
+#else
+    // No S32C1I, so do this by disabling and re-enabling interrupts (slower)
+    uint32_t intlevel, old_value;
+    __asm__ __volatile__ ("rsil %0, " XTSTR(XCHAL_EXCM_LEVEL) "\n"
+                          : "=r"(intlevel));
+
+    old_value = *addr;
+    if (old_value == compare) {
+        *addr = *set;
+    }
+
+    __asm__ __volatile__ ("memw \n"
+                          "wsr %0, ps\n"
+                          :: "r"(intlevel));
+
+    *set = old_value;
+#endif
 }
 
 
@@ -316,7 +407,7 @@ void _frxt_setup_switch( void );
 #define portYIELD()					vPortYield()
 #define portYIELD_FROM_ISR()        {traceISR_EXIT_TO_SCHEDULER(); _frxt_setup_switch();}
 
-static inline uint32_t xPortGetCoreID();
+static inline uint32_t xPortGetCoreID(void);
 
 /* Yielding within an API call (when interrupts are off), means the yield should be delayed
    until interrupts are re-enabled.
@@ -365,9 +456,18 @@ typedef struct {
 	#define PRIVILEGED_DATA
 #endif
 
+extern void esp_vApplicationIdleHook( void );
+extern void esp_vApplicationTickHook( void );
+
+#ifndef CONFIG_FREERTOS_LEGACY_HOOKS
+#define vApplicationIdleHook    esp_vApplicationIdleHook
+#define vApplicationTickHook    esp_vApplicationTickHook
+#endif /* !CONFIG_FREERTOS_LEGACY_HOOKS */
 
 void _xt_coproc_release(volatile void * coproc_sa_base);
+void vApplicationSleep( TickType_t xExpectedIdleTime );
 
+#define portSUPPRESS_TICKS_AND_SLEEP( idleTime ) vApplicationSleep( idleTime )
 
 // porttrace
 #if configUSE_TRACE_FACILITY_2

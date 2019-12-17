@@ -60,11 +60,20 @@ const soc_memory_type_desc_t soc_memory_types[] = {
     { "PID5DRAM", { MALLOC_CAP_PID5|MALLOC_CAP_INTERNAL, MALLOC_CAP_8BIT, MALLOC_CAP_32BIT|MALLOC_CAP_DEFAULT }, false, false},
     { "PID6DRAM", { MALLOC_CAP_PID6|MALLOC_CAP_INTERNAL, MALLOC_CAP_8BIT, MALLOC_CAP_32BIT|MALLOC_CAP_DEFAULT }, false, false},
     { "PID7DRAM", { MALLOC_CAP_PID7|MALLOC_CAP_INTERNAL, MALLOC_CAP_8BIT, MALLOC_CAP_32BIT|MALLOC_CAP_DEFAULT }, false, false},
+#ifdef CONFIG_SPIRAM
     //Type 15: SPI SRAM data
     { "SPIRAM", { MALLOC_CAP_SPIRAM|MALLOC_CAP_DEFAULT, 0, MALLOC_CAP_8BIT|MALLOC_CAP_32BIT}, false, false},
+#endif
 };
 
 const size_t soc_memory_type_count = sizeof(soc_memory_types)/sizeof(soc_memory_type_desc_t);
+
+#if CONFIG_SPIRAM_SIZE == -1
+// Assume we need to reserve 4MB in the auto-detection case
+#define RESERVE_SPIRAM_SIZE (4*1024*1024)
+#else
+#define RESERVE_SPIRAM_SIZE CONFIG_SPIRAM_SIZE
+#endif
 
 /*
 Region descriptors. These describe all regions of memory available, and map them to a type in the above type.
@@ -73,7 +82,9 @@ Because of requirements in the coalescing code which merges adjacent regions, th
 from low to high start address.
 */
 const soc_memory_region_t soc_memory_regions[] = {
-    { 0x3F800000, 0x400000, 15, 0}, //SPI SRAM, if available
+#ifdef CONFIG_SPIRAM
+    { SOC_EXTRAM_DATA_LOW, RESERVE_SPIRAM_SIZE, 15, 0}, //SPI SRAM, if available
+#endif
     { 0x3FFAE000, 0x2000, 0, 0}, //pool 16 <- used for rom code
     { 0x3FFB0000, 0x8000, 0, 0}, //pool 15 <- if BT is enabled, used as BT HW shared memory
     { 0x3FFB8000, 0x8000, 0, 0}, //pool 14 <- if BT is enabled, used data memory for BT ROM functions.
@@ -126,9 +137,10 @@ const size_t soc_memory_region_count = sizeof(soc_memory_regions)/sizeof(soc_mem
 
    These are removed from the soc_memory_regions array when heaps are created.
  */
-const soc_reserved_region_t soc_reserved_regions[] = {
-    { 0x40070000, 0x40078000 }, //CPU0 cache region
-    { 0x40078000, 0x40080000 }, //CPU1 cache region
+SOC_RESERVE_MEMORY_REGION(SOC_CACHE_PRO_LOW, SOC_CACHE_PRO_HIGH, cpu0_cache);
+#ifndef CONFIG_FREERTOS_UNICORE
+SOC_RESERVE_MEMORY_REGION(SOC_CACHE_APP_LOW, SOC_CACHE_APP_HIGH, cpu1_cache);
+#endif
 
     /* Warning: The ROM stack is located in the 0x3ffe0000 area. We do not specifically disable that area here because
        after the scheduler has started, the ROM stack is not used anymore by anything. We handle it instead by not allowing
@@ -146,27 +158,23 @@ const soc_reserved_region_t soc_reserved_regions[] = {
        list entries happen to end up in a region that is not touched by the stack; they can be placed safely there.
     */
 
-    { 0x3ffe0000, 0x3ffe0440 }, //Reserve ROM PRO data region
-    { 0x3ffe4000, 0x3ffe4350 }, //Reserve ROM APP data region
+SOC_RESERVE_MEMORY_REGION(0x3ffe0000, 0x3ffe0440, rom_pro_data); //Reserve ROM PRO data region
+#ifndef CONFIG_FREERTOS_UNICORE
+SOC_RESERVE_MEMORY_REGION(0x3ffe3f20, 0x3ffe4350, rom_app_data); //Reserve ROM APP data region
+#endif
 
-#if CONFIG_BT_ENABLED
-    { 0x3ffb0000, 0x3ffc0000 }, //Reserve BT hardware shared memory & BT data region
-    { 0x3ffae000, 0x3ffaff10 }, //Reserve ROM data region, inc region needed for BT ROM routines
+SOC_RESERVE_MEMORY_REGION(0x3ffae000, 0x3ffae6e0, rom_data);
+
+#if CONFIG_ESP32_MEMMAP_TRACEMEM
+#if CONFIG_ESP32_MEMMAP_TRACEMEM_TWOBANKS
+SOC_RESERVE_MEMORY_REGION(0x3fff8000, 0x40000000, trace_mem); //Reserve trace mem region, 32K for both cpu
 #else
-    { 0x3ffae000, 0x3ffae6e0 }, //Reserve ROM data region
-#endif
-
-#if CONFIG_MEMMAP_TRACEMEM
-#if CONFIG_MEMMAP_TRACEMEM_TWOBANKS
-    { 0x3fff8000, 0x40000000 }, //Reserve trace mem region
-#else
-    { 0x3fff8000, 0x3fffc000 }, //Reserve trace mem region
+SOC_RESERVE_MEMORY_REGION(0x3fffc000, 0x40000000, trace_mem); //Reserve trace mem region, 16K (upper-half) for pro cpu
 #endif
 #endif
 
-    { 0x3f800000, 0x3fC00000 }, //SPI RAM gets added later if needed, in spiram.c; reserve it for now
-};
-
-const size_t soc_reserved_region_count = sizeof(soc_reserved_regions)/sizeof(soc_reserved_region_t);
-
+#ifdef CONFIG_SPIRAM
+SOC_RESERVE_MEMORY_REGION(SOC_EXTRAM_DATA_LOW, SOC_EXTRAM_DATA_LOW + RESERVE_SPIRAM_SIZE, spi_ram); //SPI RAM gets added later if needed, in spiram.c; reserve it for now
 #endif
+
+#endif /* BOOTLOADER_BUILD */

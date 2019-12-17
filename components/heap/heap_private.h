@@ -18,7 +18,7 @@
 #include <freertos/FreeRTOS.h>
 #include <soc/soc_memory_layout.h>
 #include "multi_heap.h"
-#include "rom/queue.h"
+#include "sys/queue.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,6 +27,8 @@ extern "C" {
 /* Some common heap registration data structures used
    for heap_caps_init.c to share heap information with heap_caps.c
 */
+
+#define HEAP_SIZE_MAX (SOC_MAX_CONTIGUOUS_RAM_SIZE)
 
 /* Type for describing each registered heap */
 typedef struct heap_t_ {
@@ -48,6 +50,18 @@ extern SLIST_HEAD(registered_heap_ll, heap_t_) registered_heaps;
 
 bool heap_caps_match(const heap_t *heap, uint32_t caps);
 
+/* return all possible capabilities (across all priorities) for a given heap */
+inline static IRAM_ATTR uint32_t get_all_caps(const heap_t *heap)
+{
+    if (heap->heap == NULL) {
+        return 0;
+    }
+    uint32_t all_caps = 0;
+    for (int prio = 0; prio < SOC_MEMORY_TYPE_NO_PRIOS; prio++) {
+        all_caps |= heap->caps[prio];
+    }
+    return all_caps;
+}
 
 /*
  Because we don't want to add _another_ known allocation method to the stack of functions to trace wrt memory tracing,

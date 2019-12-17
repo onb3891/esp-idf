@@ -76,7 +76,7 @@ TEST_CASE("multi_heap fragmentation", "[multi_heap]")
 
     printf("allocated %p %p %p %p\n", p[0], p[1], p[2], p[3]);
 
-    REQUIRE( multi_heap_malloc(heap, alloc_size * 3) == NULL ); /* no room to allocate 3*alloc_size now */
+    REQUIRE( multi_heap_malloc(heap, alloc_size * 5) == NULL ); /* no room to allocate 5*alloc_size now */
 
     printf("4 allocations:\n");
     multi_heap_dump(heap);
@@ -104,6 +104,103 @@ TEST_CASE("multi_heap fragmentation", "[multi_heap]")
     REQUIRE( p[0] == big ); /* big should now go where p[0] was freed from */
     multi_heap_free(heap, big);
 }
+
+/* Test that malloc/free does not leave free space fragmented */
+TEST_CASE("multi_heap defrag", "[multi_heap]")
+{
+    void *p[4];
+    uint8_t small_heap[512];
+    multi_heap_info_t info, info2;
+    multi_heap_handle_t heap = multi_heap_register(small_heap, sizeof(small_heap));
+
+    printf("0 ---\n");
+    multi_heap_dump(heap);
+    REQUIRE( multi_heap_check(heap, true) );
+    multi_heap_get_info(heap, &info);
+    REQUIRE( 0 == info.allocated_blocks );
+    REQUIRE( 1 == info.free_blocks );
+
+    printf("1 ---\n");
+    p[0] = multi_heap_malloc(heap, 128);
+    p[1] = multi_heap_malloc(heap, 32);
+    multi_heap_dump(heap);
+    REQUIRE( multi_heap_check(heap, true) );
+
+    printf("2 ---\n");
+    multi_heap_free(heap, p[0]);
+    p[2] = multi_heap_malloc(heap, 64);
+    multi_heap_dump(heap);
+    REQUIRE( p[2] == p[0] );
+    REQUIRE( multi_heap_check(heap, true) );
+
+    printf("3 ---\n");
+    multi_heap_free(heap, p[2]);
+    p[3] = multi_heap_malloc(heap, 32);
+    multi_heap_dump(heap);
+    REQUIRE( p[3] == p[0] );
+    REQUIRE( multi_heap_check(heap, true) );
+
+    multi_heap_get_info(heap, &info2);
+    REQUIRE( 2 == info2.allocated_blocks );
+    REQUIRE( 2 == info2.free_blocks );
+
+    multi_heap_free(heap, p[0]);
+    multi_heap_free(heap, p[1]);
+    multi_heap_get_info(heap, &info2);
+    REQUIRE( 0 == info2.allocated_blocks );
+    REQUIRE( 1 == info2.free_blocks );
+    REQUIRE( info.total_free_bytes == info2.total_free_bytes );
+}
+
+/* Test that malloc/free does not leave free space fragmented
+   Note: With fancy poisoning, realloc is implemented as malloc-copy-free and this test does not apply.
+ */
+#ifndef MULTI_HEAP_POISONING_SLOW
+TEST_CASE("multi_heap defrag realloc", "[multi_heap]")
+{
+    void *p[4];
+    uint8_t small_heap[512];
+    multi_heap_info_t info, info2;
+    multi_heap_handle_t heap = multi_heap_register(small_heap, sizeof(small_heap));
+
+    printf("0 ---\n");
+    multi_heap_dump(heap);
+    REQUIRE( multi_heap_check(heap, true) );
+    multi_heap_get_info(heap, &info);
+    REQUIRE( 0 == info.allocated_blocks );
+    REQUIRE( 1 == info.free_blocks );
+
+    printf("1 ---\n");
+    p[0] = multi_heap_malloc(heap, 128);
+    p[1] = multi_heap_malloc(heap, 32);
+    multi_heap_dump(heap);
+    REQUIRE( multi_heap_check(heap, true) );
+
+    printf("2 ---\n");
+    p[2] = multi_heap_realloc(heap, p[0], 64);
+    multi_heap_dump(heap);
+    REQUIRE( p[2] == p[0] );
+    REQUIRE( multi_heap_check(heap, true) );
+
+    printf("3 ---\n");
+    p[3] = multi_heap_realloc(heap, p[2], 32);
+    multi_heap_dump(heap);
+    REQUIRE( p[3] == p[0] );
+    REQUIRE( multi_heap_check(heap, true) );
+
+    multi_heap_get_info(heap, &info2);
+    REQUIRE( 2 == info2.allocated_blocks );
+    REQUIRE( 2 == info2.free_blocks );
+
+    multi_heap_free(heap, p[0]);
+    multi_heap_free(heap, p[1]);
+    multi_heap_get_info(heap, &info2);
+    REQUIRE( 0 == info2.allocated_blocks );
+    REQUIRE( 1 == info2.free_blocks );
+    REQUIRE( info.total_free_bytes == info2.total_free_bytes );
+}
+#endif
+
 
 TEST_CASE("multi_heap many random allocations", "[multi_heap]")
 {
@@ -329,7 +426,13 @@ TEST_CASE("multi_heap_realloc()", "[multi_heap]")
     REQUIRE( multi_heap_check(heap, true) );
     REQUIRE( f == b ); /* 'b' should be extended in-place, over space formerly occupied by 'd' */
 
-    uint32_t *g = (uint32_t *)multi_heap_realloc(heap, e, 128); /* not enough contiguous space left in the heap */
+#ifdef MULTI_HEAP_POISONING
+#define TOO_MUCH 92 + 1
+#else
+#define TOO_MUCH 128 + 1
+#endif
+    /* not enough contiguous space left in the heap */
+    uint32_t *g = (uint32_t *)multi_heap_realloc(heap, e, TOO_MUCH);
     REQUIRE( g == NULL );
 
     multi_heap_free(heap, f);
@@ -349,4 +452,45 @@ TEST_CASE("corrupt heap block", "[multi_heap]")
     REQUIRE( multi_heap_check(heap, true) );
     memset(a, 0xEE, 64);
     REQUIRE( !multi_heap_check(heap, true) );
+}
+
+TEST_CASE("unaligned heaps", "[multi_heap]")
+{
+    const size_t CHUNK_LEN = 256;
+    const size_t CANARY_LEN = 16;
+    const uint8_t CANARY_BYTE = 0x3E;
+    uint8_t heap_chunk[CHUNK_LEN + CANARY_LEN * 2];
+
+    /* Put some canary bytes before and after the bytes we intend to use for
+       the heap, make sure they aren't ever overwritten */
+    memset(heap_chunk, CANARY_BYTE, CANARY_LEN);
+    memset(heap_chunk + CANARY_LEN + CHUNK_LEN, CANARY_BYTE, CANARY_LEN);
+
+    for (int i = 0; i < 8; i++) {
+        printf("Testing with offset %d\n", i);
+        multi_heap_handle_t heap = multi_heap_register(heap_chunk + CANARY_LEN + i, CHUNK_LEN - i);
+        multi_heap_info_t info;
+
+        REQUIRE( multi_heap_check(heap, true) );
+
+        multi_heap_get_info(heap, &info);
+
+        REQUIRE( info.total_free_bytes > CHUNK_LEN - 64 - i );
+        REQUIRE( info.largest_free_block > CHUNK_LEN - 64 - i );
+
+        void *a = multi_heap_malloc(heap, info.largest_free_block);
+        REQUIRE( a != NULL );
+        memset(a, 0xAA, info.largest_free_block);
+
+        REQUIRE( multi_heap_check(heap, true) );
+
+        multi_heap_free(heap, a);
+
+        REQUIRE( multi_heap_check(heap, true) );
+
+        for (unsigned j = 0; j < CANARY_LEN; j++) { // check canaries
+            REQUIRE( heap_chunk[j] == CANARY_BYTE );
+            REQUIRE( heap_chunk[CHUNK_LEN + CANARY_LEN + j] == CANARY_BYTE );
+        }
+    }
 }

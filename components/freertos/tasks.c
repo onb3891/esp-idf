@@ -70,15 +70,13 @@
 /* Standard includes. */
 #include <stdlib.h>
 #include <string.h>
+#include "sdkconfig.h"
 
 /* Defining MPU_WRAPPERS_INCLUDED_FROM_API_FILE prevents task.h from redefining
 all the API functions to use the MPU wrappers.  That should only be done when
 task.h is included from an application file. */
 #define MPU_WRAPPERS_INCLUDED_FROM_API_FILE
-
-#include "rom/ets_sys.h"
 #include "esp_newlib.h"
-#include "esp_panic.h"
 
 /* FreeRTOS includes. */
 #include "FreeRTOS.h"
@@ -86,6 +84,7 @@ task.h is included from an application file. */
 #include "timers.h"
 #include "StackMacros.h"
 #include "portmacro.h"
+#include "portmacro_priv.h"
 #include "semphr.h"
 
 /* Lint e961 and e750 are suppressed as a MISRA exception justified because the
@@ -302,10 +301,8 @@ when the scheduler is unsuspended.  The pending ready list itself can only be
 accessed from a critical section. */
 PRIVILEGED_DATA static volatile UBaseType_t uxSchedulerSuspended[ portNUM_PROCESSORS ]	= { ( UBaseType_t ) pdFALSE };
 
-/* For now, we use just one mux for all the critical sections. ToDo: give everything a bit more granularity;
-  that could improve performance by not needlessly spinning in spinlocks for unrelated resources. */
+/* We use just one spinlock for all the critical sections. */
 PRIVILEGED_DATA static portMUX_TYPE xTaskQueueMutex = portMUX_INITIALIZER_UNLOCKED;
-PRIVILEGED_DATA static portMUX_TYPE xTickCountMutex = portMUX_INITIALIZER_UNLOCKED;
 
 #if ( configGENERATE_RUN_TIME_STATS == 1 )
 
@@ -489,7 +486,6 @@ to its original value when it is released. */
 #if configUSE_TICK_HOOK > 0
 	extern void vApplicationTickHook( void );
 #endif
-extern void esp_vApplicationTickHook( void );
 
 #if  portFIRST_TASK_HOOK
 	extern void vPortFirstTaskHook(TaskFunction_t taskfn);
@@ -1305,7 +1301,7 @@ static void prvAddNewTaskToReadyList( TCB_t *pxNewTCB, TaskFunction_t pxTaskCode
 			//No mux; no harm done if this misfires. The deleted task won't get scheduled anyway.
 			if( pxTCB == pxCurrentTCB[ core ] )	//If task was currently running on this core
 			{
-				configASSERT( uxSchedulerSuspended[ core ] == 0 );
+				configASSERT( xTaskGetSchedulerState() != taskSCHEDULER_SUSPENDED )
 
 				/* The pre-delete hook is primarily for the Windows simulator,
 				in which Windows specific clean up operations are performed,
@@ -1340,16 +1336,14 @@ static void prvAddNewTaskToReadyList( TCB_t *pxNewTCB, TaskFunction_t pxTaskCode
 
 		configASSERT( pxPreviousWakeTime );
 		configASSERT( ( xTimeIncrement > 0U ) );
-		configASSERT( uxSchedulerSuspended[ xPortGetCoreID() ] == 0 );
+		configASSERT( xTaskGetSchedulerState() != taskSCHEDULER_SUSPENDED );
 
 		taskENTER_CRITICAL(&xTaskQueueMutex);
 //		vTaskSuspendAll();
 		{
 			/* Minor optimisation.  The tick count cannot change in this
 			block. */
-//			portTICK_TYPE_ENTER_CRITICAL( &xTickCountMutex );
 			const TickType_t xConstTickCount = xTickCount;
-//			portTICK_TYPE_EXIT_CRITICAL( &xTickCountMutex );
 
 			/* Generate the tick time at which the task wants to wake. */
 			xTimeToWake = *pxPreviousWakeTime + xTimeIncrement;
@@ -1440,7 +1434,7 @@ static void prvAddNewTaskToReadyList( TCB_t *pxNewTCB, TaskFunction_t pxTaskCode
 		/* A delay time of zero just forces a reschedule. */
 		if( xTicksToDelay > ( TickType_t ) 0U )
 		{
-			configASSERT( uxSchedulerSuspended[ xPortGetCoreID() ] == 0 );
+			configASSERT( xTaskGetSchedulerState() != taskSCHEDULER_SUSPENDED );
 			taskENTER_CRITICAL(&xTaskQueueMutex);
 //			vTaskSuspendAll();
 			{
@@ -1456,9 +1450,7 @@ static void prvAddNewTaskToReadyList( TCB_t *pxNewTCB, TaskFunction_t pxTaskCode
 
 				/* Calculate the time to wake - this may overflow but this is
 				not a problem. */
-//				portTICK_TYPE_ENTER_CRITICAL( &xTickCountMutex );
 				xTimeToWake = xTickCount + xTicksToDelay;
-//				portTICK_TYPE_EXIT_CRITICAL( &xTickCountMutex );
 
 				/* We must remove ourselves from the ready list before adding
 				ourselves to the blocked list as the same list item is used for
@@ -1825,7 +1817,7 @@ static void prvAddNewTaskToReadyList( TCB_t *pxNewTCB, TaskFunction_t pxTaskCode
 			if( xSchedulerRunning != pdFALSE )
 			{
 				/* The current task has just been suspended. */
-				configASSERT( uxSchedulerSuspended[ xPortGetCoreID() ] == 0 );
+				configASSERT( xTaskGetSchedulerState() != taskSCHEDULER_SUSPENDED );
 				portYIELD_WITHIN_API();
 			}
 			else
@@ -2040,16 +2032,19 @@ BaseType_t i;
 
 	/* Add the per-core idle tasks at the lowest priority. */
 	for ( i=0; i<portNUM_PROCESSORS; i++) {
+		//Generate idle task name
+		char cIdleName[configMAX_TASK_NAME_LEN];
+		snprintf(cIdleName, configMAX_TASK_NAME_LEN, "IDLE%d", i);
 		#if ( INCLUDE_xTaskGetIdleTaskHandle == 1 )
 		{
 			/* Create the idle task, storing its handle in xIdleTaskHandle so it can
 			be returned by the xTaskGetIdleTaskHandle() function. */
-			xReturn = xTaskCreatePinnedToCore( prvIdleTask, "IDLE", tskIDLE_STACK_SIZE, ( void * ) NULL, ( tskIDLE_PRIORITY | portPRIVILEGE_BIT ), &xIdleTaskHandle[i], i ); /*lint !e961 MISRA exception, justified as it is not a redundant explicit cast to all supported compilers. */
+			xReturn = xTaskCreatePinnedToCore( prvIdleTask, cIdleName, tskIDLE_STACK_SIZE, ( void * ) NULL, ( tskIDLE_PRIORITY | portPRIVILEGE_BIT ), &xIdleTaskHandle[i], i ); /*lint !e961 MISRA exception, justified as it is not a redundant explicit cast to all supported compilers. */
 		}
 		#else
 		{
 			/* Create the idle task without storing its handle. */
-			xReturn = xTaskCreatePinnedToCore( prvIdleTask, "IDLE", tskIDLE_STACK_SIZE, ( void * ) NULL, ( tskIDLE_PRIORITY | portPRIVILEGE_BIT ), NULL, i);  /*lint !e961 MISRA exception, justified as it is not a redundant explicit cast to all supported compilers. */
+			xReturn = xTaskCreatePinnedToCore( prvIdleTask, cIdleName, tskIDLE_STACK_SIZE, ( void * ) NULL, ( tskIDLE_PRIORITY | portPRIVILEGE_BIT ), NULL, i);  /*lint !e961 MISRA exception, justified as it is not a redundant explicit cast to all supported compilers. */
 		}
 		#endif /* INCLUDE_xTaskGetIdleTaskHandle */
 	}
@@ -2121,7 +2116,7 @@ void vTaskEndScheduler( void )
 
 #if ( configUSE_NEWLIB_REENTRANT == 1 )
 //Return global reent struct if FreeRTOS isn't running,
-struct _reent* __getreent() {
+struct _reent* __getreent(void) {
 	//No lock needed because if this changes, we won't be running anymore.
 	TCB_t *currTask=xTaskGetCurrentTaskHandle();
 	if (currTask==NULL) {
@@ -2151,6 +2146,26 @@ void vTaskSuspendAll( void )
 
 #if ( configUSE_TICKLESS_IDLE != 0 )
 
+#if ( portNUM_PROCESSORS > 1 )
+
+	static BaseType_t xHaveReadyTasks( void )
+	{
+		for (int i = tskIDLE_PRIORITY + 1; i < configMAX_PRIORITIES; ++i)
+		{
+			if( listCURRENT_LIST_LENGTH( &( pxReadyTasksLists[ i ] ) ) > 0 )
+			{
+				return pdTRUE;
+			}
+			else
+			{
+				mtCOVERAGE_TEST_MARKER();
+			}
+		}
+		return pdFALSE;
+	}
+
+#endif // portNUM_PROCESSORS > 1
+
 	static TickType_t prvGetExpectedIdleTime( void )
 	{
 	TickType_t xReturn;
@@ -2161,7 +2176,18 @@ void vTaskSuspendAll( void )
 		{
 			xReturn = 0;
 		}
-		else if( listCURRENT_LIST_LENGTH( &( pxReadyTasksLists[ tskIDLE_PRIORITY ] ) ) > 1 )
+#if portNUM_PROCESSORS > 1
+		/* This function is called from Idle task; in single core case this
+		 * means that no higher priority tasks are ready to run, and we can
+		 * enter sleep. In SMP case, there might be ready tasks waiting for
+		 * the other CPU, so need to check all ready lists.
+		 */
+		else if( xHaveReadyTasks() )
+		{
+			xReturn = 0;
+		}
+#endif // portNUM_PROCESSORS > 1
+		else if( listCURRENT_LIST_LENGTH( &( pxReadyTasksLists[ tskIDLE_PRIORITY ] ) ) > portNUM_PROCESSORS )
 		{
 			/* There are other idle priority tasks in the ready state.  If
 			time slicing is used then the very next tick interrupt must be
@@ -2170,9 +2196,7 @@ void vTaskSuspendAll( void )
 		}
 		else
 		{
-			portTICK_TYPE_ENTER_CRITICAL( &xTickCountMutex );
 			xReturn = xNextTaskUnblockTime - xTickCount;
-			portTICK_TYPE_EXIT_CRITICAL( &xTickCountMutex );
 		}
 		taskEXIT_CRITICAL(&xTaskQueueMutex);
 
@@ -2187,9 +2211,9 @@ BaseType_t xTaskResumeAll( void )
 TCB_t *pxTCB;
 BaseType_t xAlreadyYielded = pdFALSE;
 
-	/* If uxSchedulerSuspended[ xPortGetCoreID() ] is zero then this function does not match a
+	/* If scheduler state is `taskSCHEDULER_RUNNING` then this function does not match a
 	previous call to vTaskSuspendAll(). */
-	configASSERT( uxSchedulerSuspended[ xPortGetCoreID() ] );
+	configASSERT( xTaskGetSchedulerState() != taskSCHEDULER_RUNNING );
 	/* It is possible that an ISR caused a task to be removed from an event
 	list while the scheduler was suspended.  If this was the case then the
 	removed task will have been added to the xPendingReadyList.  Once the
@@ -2278,31 +2302,13 @@ BaseType_t xAlreadyYielded = pdFALSE;
 
 TickType_t xTaskGetTickCount( void )
 {
-TickType_t xTicks;
-
-	/* Critical section required if running on a 16 bit processor. */
-	portTICK_TYPE_ENTER_CRITICAL( &xTickCountMutex );
-	{
-		xTicks = xTickCount;
-	}
-	portTICK_TYPE_EXIT_CRITICAL( &xTickCountMutex );
-
-	return xTicks;
+	return xTickCount;
 }
 /*-----------------------------------------------------------*/
 
 TickType_t xTaskGetTickCountFromISR( void )
 {
-TickType_t xReturn;
-
-	taskENTER_CRITICAL_ISR(&xTickCountMutex);
-	{
-		xReturn = xTickCount;
-//		vPortCPUReleaseMutex( &xTickCountMutex );
-	}
-	taskEXIT_CRITICAL_ISR(&xTickCountMutex);
-
-	return xReturn;
+	return xTickCount;
 }
 /*-----------------------------------------------------------*/
 
@@ -2437,10 +2443,10 @@ implementations require configUSE_TICKLESS_IDLE to be set to a value other than
 		/* Correct the tick count value after a period during which the tick
 		was suppressed.  Note this does *not* call the tick hook function for
 		each stepped tick. */
-		portTICK_TYPE_ENTER_CRITICAL( &xTickCountMutex );
+		portENTER_CRITICAL( &xTaskQueueMutex );
 		configASSERT( ( xTickCount + xTicksToJump ) <= xNextTaskUnblockTime );
 		xTickCount += xTicksToJump;
-		portTICK_TYPE_EXIT_CRITICAL( &xTickCountMutex );
+		portEXIT_CRITICAL( &xTaskQueueMutex );
 		traceINCREASE_TICK_COUNT( xTicksToJump );
 	}
 
@@ -2457,22 +2463,22 @@ BaseType_t xSwitchRequired = pdFALSE;
 	Increments the tick then checks to see if the new tick value will cause any
 	tasks to be unblocked. */
 
-	/* Only let core 0 increase the tick count, to keep accurate track of time. */
-	/* ToDo: This doesn't really play nice with the logic below: it means when core 1 is
-	   running a low-priority task, it will keep running it until there is a context
-	   switch, even when this routine (running on core 0) unblocks a bunch of high-priority
-	   tasks... this is less than optimal -- JD. */
-	if ( xPortGetCoreID()!=0 ) {
+	/* Only allow core 0 increase the tick count in the case of xPortSysTickHandler processing. */
+	/* And allow core 0 and core 1 to unwind uxPendedTicks during xTaskResumeAll. */
+
+	if ( xPortInIsrContext() )
+	{
 		#if ( configUSE_TICK_HOOK == 1 )
 		vApplicationTickHook();
 		#endif /* configUSE_TICK_HOOK */
+		#if ( CONFIG_FREERTOS_LEGACY_HOOKS == 1 )
 		esp_vApplicationTickHook();
+		#endif /* CONFIG_FREERTOS_LEGACY_HOOKS */
 
-		/*
-		  We can't really calculate what we need, that's done on core 0... just assume we need a switch.
-		  ToDo: Make this more intelligent? -- JD
-		*/
-		return pdTRUE;
+		if (xPortGetCoreID() == 1 )
+		{
+			return pdTRUE;
+		}
 	}
 
 
@@ -2480,14 +2486,10 @@ BaseType_t xSwitchRequired = pdFALSE;
 
 	if( uxSchedulerSuspended[ xPortGetCoreID() ] == ( UBaseType_t ) pdFALSE )
 	{
-		portTICK_TYPE_ENTER_CRITICAL( &xTickCountMutex );
+		taskENTER_CRITICAL_ISR( &xTaskQueueMutex );
 		/* Increment the RTOS tick, switching the delayed and overflowed
 		delayed lists if it wraps to 0. */
 		++xTickCount;
-		portTICK_TYPE_EXIT_CRITICAL( &xTickCountMutex );
-
-		//The other CPU may decide to mess with the task queues, so this needs a mux.
-		taskENTER_CRITICAL_ISR(&xTaskQueueMutex);
 		{
 			/* Minor optimisation.  The tick count cannot change in this
 			block. */
@@ -2601,35 +2603,11 @@ BaseType_t xSwitchRequired = pdFALSE;
 		}
 		#endif /* ( ( configUSE_PREEMPTION == 1 ) && ( configUSE_TIME_SLICING == 1 ) ) */
 
-		{
-			/* Guard against the tick hook being called when the pended tick
-			count is being unwound (when the scheduler is being unlocked). */
-			if( uxPendedTicks == ( UBaseType_t ) 0U )
-			{
-				#if ( configUSE_TICK_HOOK == 1 )
-				vApplicationTickHook();
-				#endif /* configUSE_TICK_HOOK */
-				esp_vApplicationTickHook();
-			}
-			else
-			{
-				mtCOVERAGE_TEST_MARKER();
-			}
-		}
 		taskEXIT_CRITICAL_ISR(&xTaskQueueMutex);
 	}
 	else
 	{
 		++uxPendedTicks;
-
-		/* The tick hook gets called at regular intervals, even if the
-		scheduler is locked. */
-		#if ( configUSE_TICK_HOOK == 1 )
-		{
-			vApplicationTickHook();
-		}
-		#endif
-		esp_vApplicationTickHook();
 	}
 
 	#if ( configUSE_PREEMPTION == 1 )
@@ -2942,7 +2920,7 @@ TickType_t xTimeToWake;
 			/* Add the task to the suspended task list instead of a delayed task
 			list to ensure the task is not woken by a timing event.  It will
 			block indefinitely. */
-            traceMOVED_TASK_TO_SUSPENDED_LIST(pxCurrentTCB);
+            traceMOVED_TASK_TO_SUSPENDED_LIST(pxCurrentTCB[ xPortGetCoreID() ]);
 			vListInsertEnd( &xSuspendedTaskList, &( pxCurrentTCB[ xPortGetCoreID() ]->xGenericListItem ) );
 		}
 		else
@@ -3252,7 +3230,7 @@ BaseType_t xReturn;
 	configASSERT( pxTimeOut );
 	configASSERT( pxTicksToWait );
 
-	taskENTER_CRITICAL(&xTickCountMutex);
+	taskENTER_CRITICAL(&xTaskQueueMutex);
 	{
 		/* Minor optimisation.  The tick count cannot change in this block. */
 		const TickType_t xConstTickCount = xTickCount;
@@ -3288,7 +3266,7 @@ BaseType_t xReturn;
 			xReturn = pdTRUE;
 		}
 	}
-	taskEXIT_CRITICAL(&xTickCountMutex);
+	taskEXIT_CRITICAL(&xTaskQueueMutex);
 
 	return xReturn;
 }
@@ -3403,11 +3381,12 @@ static portTASK_FUNCTION( prvIdleTask, pvParameters )
 			vApplicationIdleHook();
 		}
 		#endif /* configUSE_IDLE_HOOK */
+		#if ( CONFIG_FREERTOS_LEGACY_HOOKS == 1 )
 		{
 			/* Call the esp-idf hook system */
-			extern void esp_vApplicationIdleHook( void );
 			esp_vApplicationIdleHook();
 		}
+		#endif /* CONFIG_FREERTOS_LEGACY_HOOKS */
 
 
 		/* This conditional compilation should use inequality to 0, not equality
@@ -3427,7 +3406,6 @@ static portTASK_FUNCTION( prvIdleTask, pvParameters )
 
 			if( xExpectedIdleTime >= configEXPECTED_IDLE_TIME_BEFORE_SLEEP )
 			{
-//				vTaskSuspendAll();
 				taskENTER_CRITICAL(&xTaskQueueMutex);
 				{
 					/* Now the scheduler is suspended, the expected idle
@@ -3448,7 +3426,6 @@ static portTASK_FUNCTION( prvIdleTask, pvParameters )
 					}
 				}
 				taskEXIT_CRITICAL(&xTaskQueueMutex);
-//				( void ) xTaskResumeAll();
 			}
 			else
 			{
@@ -3750,6 +3727,10 @@ BaseType_t xTaskGetAffinity( TaskHandle_t xTask )
 				pxTaskStatusArray[ uxTask ].eCurrentState = eState;
 				pxTaskStatusArray[ uxTask ].uxCurrentPriority = pxNextTCB->uxPriority;
 
+				#if ( configTASKLIST_INCLUDE_COREID == 1 )
+				pxTaskStatusArray[ uxTask ].xCoreID = pxNextTCB->xCoreID;
+				#endif /* configTASKLIST_INCLUDE_COREID */
+
 				#if ( INCLUDE_vTaskSuspend == 1 )
 				{
 					/* If the task is in the suspended list then there is a chance
@@ -3878,6 +3859,10 @@ BaseType_t xTaskGetAffinity( TaskHandle_t xTask )
 
 	static void prvDeleteTCB( TCB_t *pxTCB )
 	{
+		/* This call is required for any port specific cleanup related to task.
+		It must be above the vPortFree() calls. */
+		portCLEAN_UP_TCB( pxTCB );
+
 		/* Free up the memory allocated by the scheduler for the task.  It is up
 		to the task to free any memory allocated at the application level. */
 		#if ( configUSE_NEWLIB_REENTRANT == 1 )
@@ -3920,7 +3905,6 @@ BaseType_t xTaskGetAffinity( TaskHandle_t xTask )
 				/* Neither the stack nor the TCB were allocated dynamically, so
 				nothing needs to be freed. */
 				configASSERT( pxTCB->ucStaticallyAllocated == tskSTATICALLY_ALLOCATED_STACK_AND_TCB	)
-				portCLEAN_UP_TCB( pxTCB );
 				mtCOVERAGE_TEST_MARKER();
 			}
 		}
@@ -4039,7 +4023,7 @@ TCB_t *pxTCB;
 	{
 	TCB_t * const pxTCB = ( TCB_t * ) pxMutexHolder;
 
-		taskENTER_CRITICAL(&xTickCountMutex);
+		taskENTER_CRITICAL(&xTaskQueueMutex);
 		/* If the mutex was given back by an interrupt while the queue was
 		locked then the mutex holder might now be NULL. */
 		if( pxMutexHolder != NULL )
@@ -4096,7 +4080,7 @@ TCB_t *pxTCB;
 			mtCOVERAGE_TEST_MARKER();
 		}
 
-		taskEXIT_CRITICAL(&xTickCountMutex);
+		taskEXIT_CRITICAL(&xTaskQueueMutex);
 
 	}
 
@@ -4109,7 +4093,7 @@ TCB_t *pxTCB;
 	{
 	TCB_t * const pxTCB = ( TCB_t * ) pxMutexHolder;
 	BaseType_t xReturn = pdFALSE;
-		taskENTER_CRITICAL(&xTickCountMutex);
+		taskENTER_CRITICAL(&xTaskQueueMutex);
 
 		if( pxMutexHolder != NULL )
 		{
@@ -4173,7 +4157,7 @@ TCB_t *pxTCB;
 			mtCOVERAGE_TEST_MARKER();
 		}
 
-		taskEXIT_CRITICAL(&xTickCountMutex);
+		taskEXIT_CRITICAL(&xTaskQueueMutex);
 		return xReturn;
 	}
 
@@ -4411,7 +4395,11 @@ For ESP32 FreeRTOS, vTaskExitCritical implements both portEXIT_CRITICAL and port
 				pcWriteBuffer = prvWriteNameToBuffer( pcWriteBuffer, pxTaskStatusArray[ x ].pcTaskName );
 
 				/* Write the rest of the string. */
+#if configTASKLIST_INCLUDE_COREID
+				sprintf( pcWriteBuffer, "\t%c\t%u\t%u\t%u\t%hd\r\n", cStatus, ( unsigned int ) pxTaskStatusArray[ x ].uxCurrentPriority, ( unsigned int ) pxTaskStatusArray[ x ].usStackHighWaterMark, ( unsigned int ) pxTaskStatusArray[ x ].xTaskNumber, ( int ) pxTaskStatusArray[ x ].xCoreID );
+#else
 				sprintf( pcWriteBuffer, "\t%c\t%u\t%u\t%u\r\n", cStatus, ( unsigned int ) pxTaskStatusArray[ x ].uxCurrentPriority, ( unsigned int ) pxTaskStatusArray[ x ].usStackHighWaterMark, ( unsigned int ) pxTaskStatusArray[ x ].xTaskNumber );
+#endif
 				pcWriteBuffer += strlen( pcWriteBuffer );
 			}
 
@@ -4632,7 +4620,7 @@ TickType_t uxReturn;
 							of a delayed task list to ensure the task is not
 							woken by a timing event.  It will block
 							indefinitely. */
-                            traceMOVED_TASK_TO_SUSPENDED_LIST(pxCurrentTCB);
+                            traceMOVED_TASK_TO_SUSPENDED_LIST(pxCurrentTCB[ xPortGetCoreID() ]);
 							vListInsertEnd( &xSuspendedTaskList, &( pxCurrentTCB[ xPortGetCoreID() ]->xGenericListItem ) );
 						}
 						else
@@ -4748,7 +4736,7 @@ TickType_t uxReturn;
 							of a delayed task list to ensure the task is not
 							woken by a timing event.  It will block
 							indefinitely. */
-                            traceMOVED_TASK_TO_SUSPENDED_LIST(pxCurrentTCB);
+                            traceMOVED_TASK_TO_SUSPENDED_LIST(pxCurrentTCB[ xPortGetCoreID() ]);
 							vListInsertEnd( &xSuspendedTaskList, &( pxCurrentTCB[ xPortGetCoreID() ]->xGenericListItem ) );
 						}
 						else

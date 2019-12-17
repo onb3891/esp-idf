@@ -18,8 +18,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include "rom/ets_sys.h"
-#include "lwip/mem.h"
+#include "esp_err.h"
+// #include "esp32/rom/ets_sys.h"
+
 typedef long os_time_t;
 
 /**
@@ -187,7 +188,7 @@ char * os_readfile(const char *name, size_t *len);
  * OS_NO_C_LIB_DEFINES can be defined to skip all defines here in which case
  * these functions need to be implemented in os_*.c file for the target system.
  */
- 
+
 #ifndef os_malloc
 #define os_malloc(s) malloc((s))
 #endif
@@ -199,6 +200,10 @@ char * os_readfile(const char *name, size_t *len);
 #endif
 #ifndef os_free
 #define os_free(p) free((p))
+#endif
+
+#ifndef os_bzero
+#define os_bzero(s, n) bzero(s, n)
 #endif
 
 
@@ -223,6 +228,10 @@ char * ets_strdup(const char *s);
 #ifndef os_memcmp
 #define os_memcmp(s1, s2, n) memcmp((s1), (s2), (n))
 #endif
+#ifndef os_memcmp_const
+#define os_memcmp_const(s1, s2, n) memcmp((s1), (s2), (n))
+#endif
+
 
 #ifndef os_strlen
 #define os_strlen(s) strlen(s)
@@ -265,9 +274,14 @@ char * ets_strdup(const char *s);
 #ifdef _MSC_VER
 #define os_snprintf _snprintf
 #else
-#define os_snprintf vsnprintf
+#define os_snprintf snprintf
 #endif
 #endif
+
+static inline int os_snprintf_error(size_t size, int res)
+{
+        return res < 0 || (unsigned int) res >= size;
+}
 
 /**
  * os_strlcpy - Copy a string with size bound and NUL-termination

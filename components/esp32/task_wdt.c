@@ -25,16 +25,19 @@
 #include "freertos/semphr.h"
 #include <esp_types.h>
 #include "esp_err.h"
-#include "esp_intr.h"
 #include "esp_intr_alloc.h"
 #include "esp_attr.h"
 #include "esp_freertos_hooks.h"
-#include "soc/timer_group_struct.h"
-#include "soc/timer_group_reg.h"
+#include "soc/timer_periph.h"
 #include "esp_log.h"
 #include "driver/timer.h"
 #include "driver/periph_ctrl.h"
 #include "esp_task_wdt.h"
+#include "esp_private/system_internal.h"
+#include "hal/timer_ll.h"
+
+
+static const char *TAG = "task_wdt";
 
 //Assertion macro where, if 'cond' is false, will exit the critical section and return 'ret'
 #define ASSERT_EXIT_CRIT_RETURN(cond, ret)  ({                              \
@@ -103,16 +106,27 @@ static twdt_task_t *find_task_in_twdt_list(TaskHandle_t handle, bool *all_reset)
  * Resets the hardware timer and has_reset flags of each task on the list.
  * Called within critical
  */
-static void reset_hw_timer()
+static void reset_hw_timer(void)
 {
     //All tasks have reset; time to reset the hardware timer.
-    TIMERG0.wdt_wprotect=TIMG_WDT_WKEY_VALUE;
-    TIMERG0.wdt_feed=1;
-    TIMERG0.wdt_wprotect=0;
+    timer_ll_wdt_set_protect(&TIMERG0, false);
+    timer_ll_wdt_feed(&TIMERG0);
+    timer_ll_wdt_set_protect(&TIMERG0, true);
     //Clear all has_reset flags in list
     for (twdt_task_t *task = twdt_config->list; task != NULL; task = task->next){
         task->has_reset=false;
     }
+}
+
+/*
+ * This function is called by task_wdt_isr function (ISR for when TWDT times out).
+ * It can be redefined in user code to handle twdt events.
+ * Note: It has the same limitations as the interrupt function.
+ *       Do not use ESP_LOGI functions inside.
+ */
+void __attribute__((weak)) esp_task_wdt_isr_user_handler(void)
+{
+
 }
 
 /*
@@ -121,16 +135,16 @@ static void reset_hw_timer()
  */
 static void task_wdt_isr(void *arg)
 {
-    portENTER_CRITICAL(&twdt_spinlock);
+    portENTER_CRITICAL_ISR(&twdt_spinlock);
     twdt_task_t *twdttask;
     const char *cpu;
     //Reset hardware timer so that 2nd stage timeout is not reached (will trigger system reset)
-    TIMERG0.wdt_wprotect=TIMG_WDT_WKEY_VALUE;
-    TIMERG0.wdt_feed=1;
-    TIMERG0.wdt_wprotect=0;
+    timer_ll_wdt_set_protect(&TIMERG0, false);
+    timer_ll_wdt_feed(&TIMERG0);
+    timer_ll_wdt_set_protect(&TIMERG0, true);
     //Acknowledge interrupt
-    TIMERG0.int_clr_timers.wdt=1;
-    //We are taking a spinlock while doing I/O (ets_printf) here. Normally, that is a pretty
+    timer_ll_wdt_clear_intr_status(&TIMERG0);
+    //We are taking a spinlock while doing I/O (ESP_EARLY_LOGE) here. Normally, that is a pretty
     //bad thing, possibly (temporarily) hanging up the 2nd core and stopping FreeRTOS. In this case,
     //something bad already happened and reporting this is considered more important
     //than the badness caused by a spinlock here.
@@ -139,26 +153,28 @@ static void task_wdt_isr(void *arg)
     ASSERT_EXIT_CRIT_RETURN((twdt_config->list != NULL), VOID_RETURN);
 
     //Watchdog got triggered because at least one task did not reset in time.
-    ets_printf("Task watchdog got triggered. The following tasks did not reset the watchdog in time:\n");
+    ESP_EARLY_LOGE(TAG, "Task watchdog got triggered. The following tasks did not reset the watchdog in time:");
     for (twdttask=twdt_config->list; twdttask!=NULL; twdttask=twdttask->next) {
         if (!twdttask->has_reset) {
             cpu=xTaskGetAffinity(twdttask->task_handle)==0?DRAM_STR("CPU 0"):DRAM_STR("CPU 1");
             if (xTaskGetAffinity(twdttask->task_handle)==tskNO_AFFINITY) cpu=DRAM_STR("CPU 0/1");
-            ets_printf(" - %s (%s)\n", pcTaskGetTaskName(twdttask->task_handle), cpu);
+            ESP_EARLY_LOGE(TAG, " - %s (%s)", pcTaskGetTaskName(twdttask->task_handle), cpu);
         }
     }
-    ets_printf(DRAM_STR("Tasks currently running:\n"));
+    ESP_EARLY_LOGE(TAG, "%s", DRAM_STR("Tasks currently running:"));
     for (int x=0; x<portNUM_PROCESSORS; x++) {
-        ets_printf("CPU %d: %s\n", x, pcTaskGetTaskName(xTaskGetCurrentTaskHandleForCPU(x)));
+        ESP_EARLY_LOGE(TAG, "CPU %d: %s", x, pcTaskGetTaskName(xTaskGetCurrentTaskHandleForCPU(x)));
     }
 
+    esp_task_wdt_isr_user_handler();
     if (twdt_config->panic){     //Trigger Panic if configured to do so
-        ets_printf("Aborting.\n");
-        portEXIT_CRITICAL(&twdt_spinlock);
+        ESP_EARLY_LOGE(TAG, "Aborting.");
+        portEXIT_CRITICAL_ISR(&twdt_spinlock);
+        esp_reset_reason_set_hint(ESP_RST_TASK_WDT);
         abort();
     }
 
-    portEXIT_CRITICAL(&twdt_spinlock);
+    portEXIT_CRITICAL_ISR(&twdt_spinlock);
 }
 
 /*
@@ -180,42 +196,43 @@ esp_err_t esp_task_wdt_init(uint32_t timeout, bool panic)
         twdt_config->panic = panic;
 
         //Register Interrupt and ISR
-        ESP_ERROR_CHECK(esp_intr_alloc(ETS_TG0_WDT_LEVEL_INTR_SOURCE, 0, task_wdt_isr, NULL, &twdt_config->intr_handle))
+        ESP_ERROR_CHECK(esp_intr_alloc(ETS_TG0_WDT_LEVEL_INTR_SOURCE, 0, task_wdt_isr, NULL, &twdt_config->intr_handle));
 
         //Configure hardware timer
         periph_module_enable(PERIPH_TIMG0_MODULE);
-        TIMERG0.wdt_wprotect=TIMG_WDT_WKEY_VALUE;               //Disable write protection
-        TIMERG0.wdt_config0.sys_reset_length=7;                 //3.2uS
-        TIMERG0.wdt_config0.cpu_reset_length=7;                 //3.2uS
-        TIMERG0.wdt_config0.level_int_en=1;
-        TIMERG0.wdt_config0.stg0=TIMG_WDT_STG_SEL_INT;          //1st stage timeout: interrupt
-        TIMERG0.wdt_config0.stg1=TIMG_WDT_STG_SEL_RESET_SYSTEM; //2nd stage timeout: reset system
-        TIMERG0.wdt_config1.clk_prescale=80*500;                //Prescaler: wdt counts in ticks of 0.5mS
-        TIMERG0.wdt_config2=twdt_config->timeout*2000;      //Set timeout before interrupt
-        TIMERG0.wdt_config3=twdt_config->timeout*4000;      //Set timeout before reset
-        TIMERG0.wdt_config0.en=1;
-        TIMERG0.wdt_feed=1;
-        TIMERG0.wdt_wprotect=0;                         //Enable write protection
-
-    }else{      //twdt_config previously initialized
+        timer_ll_wdt_set_protect(&TIMERG0, false);               //Disable write protection
+        timer_ll_wdt_init(&TIMERG0);
+        timer_ll_wdt_set_tick(&TIMERG0, TG0_WDT_TICK_US); //Prescaler: wdt counts in ticks of TG0_WDT_TICK_US
+        //1st stage timeout: interrupt
+        timer_ll_wdt_set_timeout_behavior(&TIMERG0, 0, TIMER_WDT_INT);
+        timer_ll_wdt_set_timeout(&TIMERG0, 0, twdt_config->timeout*1000*1000/TG0_WDT_TICK_US);
+        //2nd stage timeout: reset system
+        timer_ll_wdt_set_timeout_behavior(&TIMERG0, 1, TIMER_WDT_RESET_SYSTEM);
+        timer_ll_wdt_set_timeout(&TIMERG0, 1, 2*twdt_config->timeout*1000*1000/TG0_WDT_TICK_US);
+        timer_ll_wdt_set_enable(&TIMERG0, true);
+        timer_ll_wdt_feed(&TIMERG0);
+        timer_ll_wdt_set_protect(&TIMERG0, true);                         //Enable write protection
+    } else {      //twdt_config previously initialized
         //Reconfigure task wdt
         twdt_config->panic = panic;
         twdt_config->timeout = timeout;
 
         //Reconfigure hardware timer
-        TIMERG0.wdt_wprotect=TIMG_WDT_WKEY_VALUE;   //Disable write protection
-        TIMERG0.wdt_config0.en=0;                   //Disable timer
-        TIMERG0.wdt_config2=twdt_config->timeout*2000;           //Set timeout before interrupt
-        TIMERG0.wdt_config3=twdt_config->timeout*4000;           //Set timeout before reset
-        TIMERG0.wdt_config0.en=1;                   //Renable timer
-        TIMERG0.wdt_feed=1;                         //Reset timer
-        TIMERG0.wdt_wprotect=0;                     //Enable write protection
+        timer_ll_wdt_set_protect(&TIMERG0, false);   //Disable write protection
+        timer_ll_wdt_set_enable(&TIMERG0, false);                   //Disable timer
+        //Set timeout before interrupt
+        timer_ll_wdt_set_timeout(&TIMERG0, 0, twdt_config->timeout*1000*1000/TG0_WDT_TICK_US);
+        //Set timeout before reset
+        timer_ll_wdt_set_timeout(&TIMERG0, 1, 2*twdt_config->timeout*1000*1000/TG0_WDT_TICK_US);
+        timer_ll_wdt_set_enable(&TIMERG0, true);                   //Renable timer
+        timer_ll_wdt_feed(&TIMERG0);                         //Reset timer
+        timer_ll_wdt_set_protect(&TIMERG0, true);                     //Enable write protection
     }
     portEXIT_CRITICAL(&twdt_spinlock);
     return ESP_OK;
 }
 
-esp_err_t esp_task_wdt_deinit()
+esp_err_t esp_task_wdt_deinit(void)
 {
     portENTER_CRITICAL(&twdt_spinlock);
     //TWDT must already be initialized
@@ -224,11 +241,11 @@ esp_err_t esp_task_wdt_deinit()
     ASSERT_EXIT_CRIT_RETURN((twdt_config->list == NULL), ESP_ERR_INVALID_STATE);
 
     //Disable hardware timer
-    TIMERG0.wdt_wprotect=TIMG_WDT_WKEY_VALUE;   //Disable write protection
-    TIMERG0.wdt_config0.en=0;                   //Disable timer
-    TIMERG0.wdt_wprotect=0;                     //Enable write protection
+    timer_ll_wdt_set_protect(&TIMERG0, false);   //Disable write protection
+    timer_ll_wdt_set_enable(&TIMERG0, false);                   //Disable timer
+    timer_ll_wdt_set_protect(&TIMERG0, true);                     //Enable write protection
 
-    ESP_ERROR_CHECK(esp_intr_free(twdt_config->intr_handle))  //Unregister interrupt
+    ESP_ERROR_CHECK(esp_intr_free(twdt_config->intr_handle));  //Unregister interrupt
     free(twdt_config);                      //Free twdt_config
     twdt_config = NULL;
     portEXIT_CRITICAL(&twdt_spinlock);
@@ -270,7 +287,7 @@ esp_err_t esp_task_wdt_add(TaskHandle_t handle)
     //If idle task, register the idle hook callback to appropriate core
     for(int i = 0; i < portNUM_PROCESSORS; i++){
         if(handle == xTaskGetIdleTaskHandleForCPU(i)){
-            ESP_ERROR_CHECK(esp_register_freertos_idle_hook_for_cpu(idle_hook_cb, i))
+            ESP_ERROR_CHECK(esp_register_freertos_idle_hook_for_cpu(idle_hook_cb, i));
             break;
         }
     }
@@ -283,7 +300,7 @@ esp_err_t esp_task_wdt_add(TaskHandle_t handle)
     return ESP_OK;
 }
 
-esp_err_t esp_task_wdt_reset()
+esp_err_t esp_task_wdt_reset(void)
 {
     portENTER_CRITICAL(&twdt_spinlock);
     //TWDT must already be initialized
@@ -370,46 +387,3 @@ esp_err_t esp_task_wdt_status(TaskHandle_t handle)
     portEXIT_CRITICAL(&twdt_spinlock);
     return ESP_ERR_NOT_FOUND;
 }
-
-void esp_task_wdt_feed()
-{
-    portENTER_CRITICAL(&twdt_spinlock);
-    //Return immediately if TWDT has not been initialized
-    ASSERT_EXIT_CRIT_RETURN((twdt_config != NULL), VOID_RETURN);
-
-    //Check if task is on list
-    TaskHandle_t handle = xTaskGetCurrentTaskHandle();
-    bool all_reset;
-    twdt_task_t *target_task = find_task_in_twdt_list(handle, &all_reset);
-
-    //reset the task if it's on the list, then return
-    if(target_task != NULL){
-        target_task->has_reset = true;
-        if(all_reset){
-            reset_hw_timer();       //Reset hardware timer if all other tasks have reset
-        }
-        portEXIT_CRITICAL(&twdt_spinlock);
-        return;
-    }
-
-    //Add task if it's has not on list
-    target_task = calloc(1, sizeof(twdt_task_t));
-    ASSERT_EXIT_CRIT_RETURN((target_task != NULL), VOID_RETURN);   //If calloc failed
-    target_task->task_handle = handle;
-    target_task->has_reset = true;
-    target_task->next = NULL;
-
-    if (twdt_config->list == NULL) {    //Adding to empty list
-        twdt_config->list = target_task;
-    } else {    //Adding to tail of list
-        twdt_task_t *task;
-        for (task = twdt_config->list; task->next != NULL; task = task->next){
-            ;   //point task to current tail of wdt task list
-        }
-        task->next = target_task;
-    }
-
-    portEXIT_CRITICAL(&twdt_spinlock);
-}
-
-

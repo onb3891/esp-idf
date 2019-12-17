@@ -97,17 +97,18 @@
 
 #include "xtensa_rtos.h"
 
-#include "rom/ets_sys.h"
 #include "soc/cpu.h"
 
 #include "FreeRTOS.h"
 #include "task.h"
 
-#include "esp_panic.h"
+#include "esp_debug_helpers.h"
 #include "esp_heap_caps.h"
-#include "esp_crosscore_int.h"
+#include "esp_private/crosscore_int.h"
 
 #include "esp_intr_alloc.h"
+#include "esp_log.h"
+#include "sdkconfig.h"
 
 /* Defined in portasm.h */
 extern void _frxt_tick_timer_init(void);
@@ -123,6 +124,8 @@ extern void _xt_coproc_init(void);
     #define SYSTICK_INTR_ID (ETS_INTERNAL_TIMER1_INTR_SOURCE+ETS_INTERNAL_INTR_SOURCE_OFF)
 #endif
 
+_Static_assert(tskNO_AFFINITY == CONFIG_FREERTOS_NO_AFFINITY, "incorrect tskNO_AFFINITY value");
+
 /*-----------------------------------------------------------*/
 
 unsigned port_xSchedulerRunning[portNUM_PROCESSORS] = {0}; // Duplicate of inaccessible xSchedulerRunning; needed at startup to avoid counting nesting
@@ -132,6 +135,18 @@ unsigned port_interruptNesting[portNUM_PROCESSORS] = {0};  // Interrupt nesting 
 
 // User exception dispatcher when exiting
 void _xt_user_exit(void);
+
+#if CONFIG_FREERTOS_TASK_FUNCTION_WRAPPER
+// Wrapper to allow task functions to return (increases stack overhead by 16 bytes)
+static void vPortTaskWrapper(TaskFunction_t pxCode, void *pvParameters)
+{
+	pxCode(pvParameters);
+	//FreeRTOS tasks should not return. Log the task name and abort.
+	char * pcTaskName = pcTaskGetTaskName(NULL);
+	ESP_LOGE("FreeRTOS", "FreeRTOS Task \"%s\" should not return, Aborting now!", pcTaskName);
+	abort();
+}
+#endif
 
 /*
  * Stack initialization
@@ -173,19 +188,33 @@ StackType_t *pxPortInitialiseStack( StackType_t *pxTopOfStack, TaskFunction_t px
 	frame = (XtExcFrame *) sp;
 
 	/* Explicitly initialize certain saved registers */
-	frame->pc   = (UBaseType_t) pxCode;             /* task entrypoint                */
-	frame->a0   = 0;                                /* to terminate GDB backtrace     */
-	frame->a1   = (UBaseType_t) sp + XT_STK_FRMSZ;  /* physical top of stack frame    */
-	frame->exit = (UBaseType_t) _xt_user_exit;      /* user exception exit dispatcher */
+	#if CONFIG_FREERTOS_TASK_FUNCTION_WRAPPER
+	frame->pc	= (UBaseType_t) vPortTaskWrapper;	/* task wrapper						*/
+	#else
+	frame->pc   = (UBaseType_t) pxCode;				/* task entrypoint					*/
+	#endif
+	frame->a0	= 0;								/* to terminate GDB backtrace		*/
+	frame->a1	= (UBaseType_t) sp + XT_STK_FRMSZ;	/* physical top of stack frame		*/
+	frame->exit = (UBaseType_t) _xt_user_exit;		/* user exception exit dispatcher	*/
 
 	/* Set initial PS to int level 0, EXCM disabled ('rfe' will enable), user mode. */
 	/* Also set entry point argument parameter. */
 	#ifdef __XTENSA_CALL0_ABI__
-	frame->a2 = (UBaseType_t) pvParameters;
+		#if CONFIG_FREERTOS_TASK_FUNCTION_WRAPPER
+		frame->a2 = (UBaseType_t) pxCode;
+		frame->a3 = (UBaseType_t) pvParameters;
+		#else
+		frame->a2 = (UBaseType_t) pvParameters;
+		#endif
 	frame->ps = PS_UM | PS_EXCM;
 	#else
 	/* + for windowed ABI also set WOE and CALLINC (pretend task was 'call4'd). */
-	frame->a6 = (UBaseType_t) pvParameters;
+		#if CONFIG_FREERTOS_TASK_FUNCTION_WRAPPER
+		frame->a6 = (UBaseType_t) pxCode;
+		frame->a7 = (UBaseType_t) pvParameters;
+		#else
+		frame->a6 = (UBaseType_t) pvParameters;
+		#endif
 	frame->ps = PS_UM | PS_EXCM | PS_WOE | PS_CALLINC(1);
 	#endif
 
@@ -302,7 +331,7 @@ void vPortReleaseTaskMPUSettings( xMPU_SETTINGS *xMPUSettings )
  * Returns true if the current core is in ISR context; low prio ISR, med prio ISR or timer tick ISR. High prio ISRs
  * aren't detected here, but they normally cannot call C code, so that should not be an issue anyway.
  */
-BaseType_t xPortInIsrContext()
+BaseType_t xPortInIsrContext(void)
 {
 	unsigned int irqStatus;
 	BaseType_t ret;
@@ -316,12 +345,12 @@ BaseType_t xPortInIsrContext()
  * This function will be called in High prio ISRs. Returns true if the current core was in ISR context
  * before calling into high prio ISR context.
  */
-BaseType_t IRAM_ATTR xPortInterruptedFromISRContext()
+BaseType_t IRAM_ATTR xPortInterruptedFromISRContext(void)
 {
 	return (port_interruptNesting[xPortGetCoreID()] != 0);
 }
 
-void vPortAssertIfInISR()
+void vPortAssertIfInISR(void)
 {
 	configASSERT(xPortInIsrContext());
 }
@@ -406,7 +435,7 @@ void vPortSetStackWatchpoint( void* pxStackStart ) {
 	esp_set_watchpoint(1, (char*)addr, 32, ESP_WATCHPOINT_STORE);
 }
 
-#if defined(CONFIG_SPIRAM_SUPPORT)
+#if defined(CONFIG_SPIRAM)
 /*
  * Compare & set (S32C1) does not work in external RAM. Instead, this routine uses a mux (in internal memory) to fake it.
  */
@@ -417,7 +446,7 @@ void uxPortCompareSetExtram(volatile uint32_t *addr, uint32_t compare, uint32_t 
 #ifdef CONFIG_FREERTOS_PORTMUX_DEBUG
 	vPortCPUAcquireMutexIntsDisabled(&extram_mux, portMUX_NO_TIMEOUT, __FUNCTION__, __LINE__);
 #else
-	vPortCPUAcquireMutexIntsDisabled(&extram_mux, portMUX_NO_TIMEOUT); 
+	vPortCPUAcquireMutexIntsDisabled(&extram_mux, portMUX_NO_TIMEOUT);
 #endif
 	prev=*addr;
 	if (prev==compare) {
@@ -430,7 +459,7 @@ void uxPortCompareSetExtram(volatile uint32_t *addr, uint32_t compare, uint32_t 
 	vPortCPUReleaseMutexIntsDisabled(&extram_mux);
 #endif
 }
-#endif //defined(CONFIG_SPIRAM_SUPPORT)
+#endif //defined(CONFIG_SPIRAM)
 
 
 

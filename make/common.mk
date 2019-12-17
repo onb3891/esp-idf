@@ -2,6 +2,8 @@
 # and component makefiles (component_wrapper.mk)
 #
 
+PYTHON=$(call dequote,$(CONFIG_SDK_PYTHON))
+
 # Include project config makefile, if it exists.
 #
 # (Note that we only rebuild this makefile automatically for some
@@ -32,9 +34,12 @@ details := @true
 MAKEFLAGS += --silent
 endif  # $(V)==1
 
-ifdef CONFIG_MAKE_WARN_UNDEFINED_VARIABLES
+ifdef CONFIG_SDK_MAKE_WARN_UNDEFINED_VARIABLES
 MAKEFLAGS += --warn-undefined-variables
 endif
+
+# Get version variables
+include $(IDF_PATH)/make/version.mk
 
 # General make utilities
 
@@ -62,7 +67,7 @@ endef
 #
 # example $(call resolvepath,$(CONFIG_PATH),$(CONFIG_DIR))
 define resolvepath
-$(foreach dir,$(1),$(if $(filter /%,$(dir)),$(dir),$(subst //,/,$(2)/$(dir))))
+$(abspath $(foreach dir,$(1),$(if $(filter /%,$(dir)),$(dir),$(subst //,/,$(2)/$(dir)))))
 endef
 
 
@@ -85,4 +90,12 @@ endef
 # Copied from http://stackoverflow.com/questions/16144115/makefile-remove-duplicate-words-without-sorting
 define uniq
 $(if $1,$(firstword $1) $(call uniq,$(filter-out $(firstword $1),$1)))
+endef
+
+# macro to strip leading ../s from a path
+# Given $(1) which is a directory, remove any leading ../s from it
+# (recursively keeps removing ../ until not found)
+# if the path contains nothing but ../.., a single . is returned (cwd)
+define stripLeadingParentDirs
+$(foreach path,$(1),$(if $(subst ..,,$(path)),$(if $(filter ../%,$(path)),$(call stripLeadingParentDirs,$(patsubst ../%,%,$(path))),$(path)),.))
 endef

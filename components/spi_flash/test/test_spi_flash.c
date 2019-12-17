@@ -8,6 +8,7 @@
 #include <esp_attr.h>
 #include "driver/timer.h"
 #include "esp_intr_alloc.h"
+#include "test_utils.h"
 
 struct flash_test_ctx {
     uint32_t offset;
@@ -15,11 +16,23 @@ struct flash_test_ctx {
     SemaphoreHandle_t done;
 };
 
+/* Base offset in flash for tests. */
+static size_t start;
+
+static void setup_tests(void)
+{
+    if (start == 0) {
+        const esp_partition_t *part = get_test_data_partition();
+        start = part->address;
+        printf("Test data partition @ 0x%x\n", start);
+    }
+}
+
 static void flash_test_task(void *arg)
 {
     struct flash_test_ctx *ctx = (struct flash_test_ctx *) arg;
     vTaskDelay(100 / portTICK_PERIOD_MS);
-    const uint32_t sector = ctx->offset;
+    const uint32_t sector = start / SPI_FLASH_SEC_SIZE + ctx->offset;
     printf("t%d\n", sector);
     printf("es%d\n", sector);
     if (spi_flash_erase_sector(sector) != ESP_OK) {
@@ -64,13 +77,15 @@ static void flash_test_task(void *arg)
 
 TEST_CASE("flash write and erase work both on PRO CPU and on APP CPU", "[spi_flash][ignore]")
 {
+    setup_tests();
+
     SemaphoreHandle_t done = xSemaphoreCreateCounting(4, 0);
     struct flash_test_ctx ctx[] = {
-            { .offset = 0x100 + 6, .done = done },
-            { .offset = 0x100 + 7, .done = done },
-            { .offset = 0x100 + 8, .done = done },
+            { .offset = 0x10 + 6, .done = done },
+            { .offset = 0x10 + 7, .done = done },
+            { .offset = 0x10 + 8, .done = done },
 #ifndef CONFIG_FREERTOS_UNICORE
-            { .offset = 0x100 + 9, .done = done }
+            { .offset = 0x10 + 9, .done = done }
 #endif
     };
 
@@ -105,10 +120,14 @@ typedef struct {
     size_t repeat_count;
 } block_task_arg_t;
 
+#ifdef CONFIG_IDF_TARGET_ESP32S2BETA
+#define int_clr_timers int_clr
+#endif
+
 static void IRAM_ATTR timer_isr(void* varg) {
     block_task_arg_t* arg = (block_task_arg_t*) varg;
-    TIMERG0.int_clr_timers.t0 = 1;
-    TIMERG0.hw_timer[0].config.alarm_en = 1;
+    timer_group_clr_intr_status_in_isr(TIMER_GROUP_0, TIMER_0);
+    timer_group_enable_alarm_in_isr(TIMER_GROUP_0, TIMER_0);
     ets_delay_us(arg->delay_time_us);
     arg->repeat_count++;
 }
@@ -123,7 +142,7 @@ static void read_task(void* varg) {
     vTaskDelete(NULL);
 }
 
-TEST_CASE("spi flash functions can run along with IRAM interrupts", "[spi_flash]")
+TEST_CASE("spi flash functions can run along with IRAM interrupts", "[spi_flash][esp_flash]")
 {
     const size_t size = 128;
     read_task_arg_t read_arg = {
@@ -167,3 +186,61 @@ TEST_CASE("spi flash functions can run along with IRAM interrupts", "[spi_flash]
     free(read_arg.buf);
 }
 
+
+#if portNUM_PROCESSORS > 1
+TEST_CASE("spi_flash deadlock with high priority busy-waiting task", "[spi_flash][esp_flash]")
+{
+    typedef struct {
+        QueueHandle_t queue;
+        volatile bool done;
+    } deadlock_test_arg_t;
+
+    /* Create two tasks: high-priority consumer on CPU0, low-priority producer on CPU1.
+     * Consumer polls the queue until it gets some data, then yields.
+     * Run flash operation on CPU0. Check that when IPC1 task blocks out the producer,
+     * the task which does flash operation does not get blocked by the consumer.
+     */
+
+    void producer_task(void* varg)
+    {
+        int dummy = 0;
+        deadlock_test_arg_t* arg = (deadlock_test_arg_t*) varg;
+        while (!arg->done) {
+            xQueueSend(arg->queue, &dummy, 0);
+            vTaskDelay(1);
+        }
+        vTaskDelete(NULL);
+    }
+
+    void consumer_task(void* varg)
+    {
+        int dummy;
+        deadlock_test_arg_t* arg = (deadlock_test_arg_t*) varg;
+        while (!arg->done) {
+            if (xQueueReceive(arg->queue, &dummy, 0) == pdTRUE) {
+                vTaskDelay(1);
+            }
+        }
+        vTaskDelete(NULL);
+    }
+    deadlock_test_arg_t arg = {
+        .queue = xQueueCreate(32, sizeof(int)),
+        .done = false
+    };
+
+    TEST_ASSERT(xTaskCreatePinnedToCore(&producer_task, "producer", 4096, &arg, 5, NULL, 1));
+    TEST_ASSERT(xTaskCreatePinnedToCore(&consumer_task, "consumer", 4096, &arg, 10, NULL, 0));
+
+    for (int i = 0; i < 1000; i++) {
+        uint32_t dummy;
+        TEST_ESP_OK(spi_flash_read(0, &dummy, sizeof(dummy)));
+    }
+
+    arg.done = true;
+    vTaskDelay(5);
+    vQueueDelete(arg.queue);
+
+    /* Check that current task priority is still correct */
+    TEST_ASSERT_EQUAL_INT(uxTaskPriorityGet(NULL), UNITY_FREERTOS_PRIORITY);
+}
+#endif // portNUM_PROCESSORS > 1
